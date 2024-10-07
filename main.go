@@ -270,6 +270,9 @@ func (app *app) displayInitialInputMessages() {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 1024*1024) // 1MB buffer
+	scanner.Buffer(buf, 1024*1024)    // Set max token size to 1MB
+
 	for i := 0; i < 10 && scanner.Scan(); i++ {
 		line := scanner.Text()
 		app.lines = append(app.lines, line)
