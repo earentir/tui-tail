@@ -13,7 +13,7 @@ import (
 
 func main() {
 	cliApp := cli.App("ttail", "A terminal-based application for viewing and filtering log files using matching rules")
-	cliApp.Version("v version", "ttail 0.1.0")
+	cliApp.Version("v version", "ttail 0.2.41")
 	cliApp.LongDesc = "A terminal-based application for viewing and filtering log files using matching rules"
 
 	inputMessagesFile := cliApp.StringArg("FILE", "", "The log file to view")
