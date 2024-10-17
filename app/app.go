@@ -39,6 +39,7 @@ const (
 )
 
 // Key bindings
+// Key bindings
 var keyBindings = map[string]rune{
 	"quit":   'q',
 	"save":   's',
@@ -46,6 +47,8 @@ var keyBindings = map[string]rune{
 	"delete": 'd',
 	"help":   'h',
 	"follow": 'f',
+	"search": '/',
+	"next":   'n',
 }
 
 // FocusState represents the current focus in the UI
@@ -57,38 +60,43 @@ const (
 	FocusRulesView
 	FocusSaveInput
 	FocusViewModal
+	FocusSearchInput
 )
 
 // App represents the application state
 type App struct {
-	tviewApp          *tview.Application
-	messagesView      *tview.List
-	rulesView         *tview.TextView
-	ruleInput         *tview.InputField
-	viewModal         *tview.TextView
-	saveFilenameInput *tview.InputField
-	progressBar       *tview.TextView
-	helpText          *tview.TextView
-	flex              *tview.Flex
-	totalLinesInFile  int
-	rules             []rules.Rule
-	colorRules        []rules.ColorRule
-	lines             []string
-	linesMutex        sync.Mutex
-	selectedLineIndex int
-	selectedRuleIndex int
-	currentFocus      FocusState
-	inputMessagesFile string
-	InitialLines      int
-	MaxLines          int
-	RulesFile         string
-	ConfigFile        string
-	FullMode          bool
-	fileOffset        int64
-	fileMutex         sync.Mutex
-	cancelFunc        context.CancelFunc
-	followMode        bool
-	HeadMode          bool
+	tviewApp           *tview.Application
+	messagesView       *tview.List
+	rulesView          *tview.TextView
+	ruleInput          *tview.InputField
+	viewModal          *tview.TextView
+	saveFilenameInput  *tview.InputField
+	searchInput        *tview.InputField
+	progressBar        *tview.TextView
+	helpText           *tview.TextView
+	flex               *tview.Flex
+	totalLinesInFile   int
+	rules              []rules.Rule
+	colorRules         []rules.ColorRule
+	lines              []string
+	linesMutex         sync.Mutex
+	selectedLineIndex  int
+	selectedRuleIndex  int
+	currentFocus       FocusState
+	inputMessagesFile  string
+	InitialLines       int
+	MaxLines           int
+	RulesFile          string
+	ConfigFile         string
+	FullMode           bool
+	fileOffset         int64
+	fileMutex          sync.Mutex
+	cancelFunc         context.CancelFunc
+	followMode         bool
+	HeadMode           bool
+	searchTerm         string
+	searchResults      []int
+	currentSearchIndex int
 }
 
 // NewApp creates a new application instance
@@ -556,10 +564,13 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 		} else if app.tviewApp.GetFocus() == app.saveFilenameInput {
 			app.cancelSave()
 			return nil
+		} else if app.tviewApp.GetFocus() == app.searchInput {
+			app.cancelSearch()
+			return nil
 		}
 	case tcell.KeyRune:
 		switch event.Rune() {
-		case keyBindings["help"]:
+		case keyBindings["help"], '?':
 			app.showHelp()
 			return nil
 		case keyBindings["quit"]:
@@ -587,7 +598,11 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			case keyBindings["delete"]:
 				app.deleteSelected()
 			case keyBindings["follow"]:
-				app.toggleFollowMode() // Handle 'f' key to toggle follow mode
+				app.toggleFollowMode()
+			case '/':
+				app.initiateSearch()
+			case 'n':
+				app.nextSearchResult()
 			}
 			return nil
 		}
@@ -643,6 +658,97 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	return event
 }
 
+// initiateSearch initiates the search mode by displaying the search input field
+func (app *App) initiateSearch() {
+	logging.LogAppAction("Initiating search operation")
+	app.searchInput.SetText("")
+	app.searchInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			app.handleSearchInput()
+		}
+	})
+	app.flex.AddItem(app.searchInput, 1, 0, true)
+	app.tviewApp.SetFocus(app.searchInput)
+	app.currentFocus = FocusSearchInput
+}
+
+// handleSearchInput handles the search input entered by the user
+func (app *App) handleSearchInput() {
+	app.searchTerm = app.searchInput.GetText()
+	app.flex.RemoveItem(app.searchInput)
+	if strings.TrimSpace(app.searchTerm) == "" {
+		logging.LogAppAction("Search term is empty")
+		app.showMessage("Search term cannot be empty", app.flex)
+		app.tviewApp.SetFocus(app.messagesView)
+		app.currentFocus = FocusMessages
+		return
+	}
+
+	app.performSearch()
+	app.tviewApp.SetFocus(app.messagesView)
+	app.currentFocus = FocusMessages
+}
+
+// performSearch searches through the messages for the search term
+func (app *App) performSearch() {
+	app.searchResults = []int{}
+	app.currentSearchIndex = 0
+
+	// Compile the regex
+	regex, err := regexp.Compile(app.searchTerm)
+	if err != nil {
+		logging.LogAppAction(fmt.Sprintf("Invalid regex: %v", err))
+		app.showMessage(fmt.Sprintf("Invalid regex: %v", err), app.flex)
+		return
+	}
+
+	// Iterate through the messages to find matches
+	for i := 0; i < app.messagesView.GetItemCount(); i++ {
+		mainText, _ := app.messagesView.GetItemText(i)
+		if regex.MatchString(mainText) {
+			app.searchResults = append(app.searchResults, i)
+		}
+	}
+
+	if len(app.searchResults) == 0 {
+		app.showMessage("No matches found", app.flex)
+		return
+	}
+
+	// Instead of showing a modal with the count, update the help pane
+	app.currentSearchIndex = 0
+	app.messagesView.SetCurrentItem(app.searchResults[app.currentSearchIndex])
+	app.selectedLineIndex = app.searchResults[app.currentSearchIndex]
+	app.updateProgressBar()
+	app.updateHelpPane() // Update help pane to display search count
+}
+
+// nextSearchResult moves to the next search result
+func (app *App) nextSearchResult() {
+	if len(app.searchResults) == 0 {
+		app.showMessage("No search in progress", app.flex)
+		return
+	}
+
+	app.currentSearchIndex = (app.currentSearchIndex + 1) % len(app.searchResults)
+	app.messagesView.SetCurrentItem(app.searchResults[app.currentSearchIndex])
+	app.selectedLineIndex = app.searchResults[app.currentSearchIndex]
+	app.updateProgressBar()
+	app.updateHelpPane() // Ensure help pane reflects the current state
+}
+
+// cancelSearch cancels the search operation and returns focus to the messages view
+func (app *App) cancelSearch() {
+	app.flex.RemoveItem(app.searchInput)
+	app.tviewApp.SetFocus(app.messagesView)
+	app.currentFocus = FocusMessages
+	// Clear search state
+	app.searchTerm = ""
+	app.searchResults = nil
+	app.currentSearchIndex = 0
+	app.updateHelpPane() // Update help pane to remove search count
+}
+
 // toggleFollowMode toggles the follow mode on or off
 func (app *App) toggleFollowMode() {
 	app.followMode = !app.followMode
@@ -683,9 +789,22 @@ func (app *App) togglePartialMatch() {
 
 // cycleFocus cycles the UI focus between different panes
 func (app *App) cycleFocus() {
-	focusOrder := []FocusState{FocusMessages, FocusRuleInput, FocusRulesView}
+	focusOrder := []FocusState{FocusMessages, FocusRuleInput, FocusRulesView, FocusSearchInput}
 	oldFocus := app.currentFocus
-	app.currentFocus = focusOrder[(int(app.currentFocus)+1)%len(focusOrder)]
+	index := -1
+	for i, focus := range focusOrder {
+		if focus == app.currentFocus {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		// Default to messages view if current focus not found
+		app.currentFocus = FocusMessages
+	} else {
+		app.currentFocus = focusOrder[(index+1)%len(focusOrder)]
+	}
+
 	switch app.currentFocus {
 	case FocusMessages:
 		app.tviewApp.SetFocus(app.messagesView)
@@ -693,6 +812,8 @@ func (app *App) cycleFocus() {
 		app.tviewApp.SetFocus(app.ruleInput)
 	case FocusRulesView:
 		app.tviewApp.SetFocus(app.rulesView)
+	case FocusSearchInput:
+		app.tviewApp.SetFocus(app.searchInput)
 	}
 	logging.LogAppAction(fmt.Sprintf("Focus cycled from %d to %d", oldFocus, app.currentFocus))
 }
@@ -839,7 +960,6 @@ func (app *App) quit() {
 }
 
 // initUI initializes the UI components and layout
-// initUI initializes the UI components and layout
 func (app *App) initUI() {
 	// Initialize messagesView
 	app.messagesView = tview.NewList()
@@ -872,6 +992,11 @@ func (app *App) initUI() {
 	app.saveFilenameInput.SetLabel("Save as: ")
 	app.saveFilenameInput.SetFieldWidth(30)
 
+	// Initialize searchInput
+	app.searchInput = tview.NewInputField()
+	app.searchInput.SetLabel("Search: ")
+	app.searchInput.SetFieldWidth(30)
+
 	// Initialize progressBar
 	app.progressBar = tview.NewTextView()
 	app.progressBar.SetDynamicColors(true)
@@ -896,6 +1021,7 @@ func (app *App) initUI() {
 		AddItem(app.ruleInput, 1, 0, false).
 		AddItem(app.rulesView, 0, 2, false).         // Adjust the ratio as needed
 		AddItem(app.saveFilenameInput, 0, 0, false). // Initially hidden
+		AddItem(app.searchInput, 0, 0, false).       // Initially hidden
 		AddItem(app.progressBar, 1, 0, false).
 		AddItem(app.helpText, 1, 0, false) // Existing help pane
 
@@ -914,6 +1040,9 @@ Keybindings:
 - Enter/v: View selected line
 - s: Save
 - d: Delete selected
+- f: Toggle follow mode
+- /: Search
+- n: Next search result
 - q: Quit
 - h: Show this help
 
@@ -1170,7 +1299,16 @@ func (app *App) updateHelpPane() {
 	// Update help text
 	helpMessage := "Press 'h' for help"
 	lineStatus := fmt.Sprintf(" | Line: %d / %d", currentLine, totalLines)
-	app.helpText.SetText(helpMessage + lineStatus)
+
+	// If a search is active, show the match count
+	if len(app.searchResults) > 0 {
+		searchStatus := fmt.Sprintf(" | Matches: %d", len(app.searchResults))
+		helpMessage += lineStatus + searchStatus
+	} else {
+		helpMessage += lineStatus
+	}
+
+	app.helpText.SetText(helpMessage)
 }
 
 // getFullContent reads the entire file content for saving in full mode
