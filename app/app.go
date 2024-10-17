@@ -88,6 +88,7 @@ type App struct {
 	MaxLines           int
 	RulesFile          string
 	ConfigFile         string
+	logFile            string
 	FullMode           bool
 	fileOffset         int64
 	fileMutex          sync.Mutex
@@ -100,7 +101,7 @@ type App struct {
 }
 
 // NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string) *App {
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
 		inputMessagesFile: inputMessagesFile,
@@ -113,6 +114,7 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		ConfigFile:        configFile,
 		FullMode:          fullMode,
 		HeadMode:          headMode,
+		logFile:           logFile,
 		followMode:        true,
 	}
 	appInstance.initUI()

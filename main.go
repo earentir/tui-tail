@@ -13,7 +13,7 @@ import (
 
 func main() {
 	cliApp := cli.App("ttail", "A terminal-based application for viewing and filtering log files using matching rules")
-	cliApp.Version("v version", "ttail 0.2.45")
+	cliApp.Version("v version", "ttail 0.2.47")
 	cliApp.LongDesc = "A terminal-based application for viewing and filtering log files using matching rules"
 
 	inputMessagesFile := cliApp.StringArg("FILE", "", "The log file to view")
@@ -23,14 +23,20 @@ func main() {
 	rulesFile := cliApp.StringOpt("r rules-file", "", "JSON file containing matching rules to load at startup")
 	configFile := cliApp.StringOpt("c colour-file", "", "JSON configuration file for color rules and settings")
 	fullMode := cliApp.BoolOpt("full", false, "Load and navigate the full file without loading all lines into memory")
-
-	// Add the --head flag
 	headMode := cliApp.BoolOpt("head", false, "Show the first N lines of the file instead of the last N lines")
+	logFile := cliApp.StringOpt("log-file", "", "Log file path or directory to write application logs to")
 
 	cliApp.Action = func() {
-		logging.InitAppLogging()
-		logging.LogAppAction(app.MsgAppStarted)
-		defer logging.LogAppAction(app.MsgAppStopped)
+		// Initialize logging if logFile is provided
+		if *logFile != "" {
+			err := logging.InitAppLogging(*logFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error initializing logging: %v\n", err)
+			} else {
+				logging.LogAppAction(app.MsgAppStarted)
+				defer logging.LogAppAction(app.MsgAppStopped)
+			}
+		}
 
 		appInstance := app.NewApp(
 			*inputMessagesFile,
@@ -40,6 +46,7 @@ func main() {
 			*configFile,
 			*fullMode,
 			*headMode,
+			*logFile, // Only if needed in App
 		)
 
 		if err := appInstance.Run(); err != nil {
