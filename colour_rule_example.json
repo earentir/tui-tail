@@ -1,0 +1,28 @@
+{
+    "color_rules": [
+        {
+            "Pattern": "ERROR",
+            "Color": "[red]",
+            "Label": "Error Messages",
+            "RuleID": "error-matcher"
+        },
+        {
+            "Pattern": "WARN",
+            "Color": "[yellow]",
+            "Label": "Warning Messages",
+            "RuleID": "warn-matcher"
+        },
+        {
+            "Pattern": "INFO",
+            "Color": "[green]",
+            "Label": "Info Messages",
+            "RuleID": "info-matcher"
+        },
+        {
+            "Pattern": "DEBUG",
+            "Color": "[blue]",
+            "Label": "Debug Messages",
+            "RuleID": "debug-matcher"
+        }
+    ]
+}
