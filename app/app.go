@@ -45,6 +45,7 @@ var keyBindings = map[string]rune{
 	"view":   'v',
 	"delete": 'd',
 	"help":   'h',
+	"follow": 'f',
 }
 
 // FocusState represents the current focus in the UI
@@ -67,7 +68,7 @@ type App struct {
 	viewModal         *tview.TextView
 	saveFilenameInput *tview.InputField
 	progressBar       *tview.TextView
-	helpText          *tview.TextView // Existing help pane
+	helpText          *tview.TextView
 	flex              *tview.Flex
 	totalLinesInFile  int
 	rules             []rules.Rule
@@ -82,15 +83,16 @@ type App struct {
 	MaxLines          int
 	RulesFile         string
 	ConfigFile        string
-	FullMode          bool // Indicates if --full flag is set
+	FullMode          bool
 	fileOffset        int64
 	fileMutex         sync.Mutex
 	cancelFunc        context.CancelFunc
+	followMode        bool
+	HeadMode          bool
 }
 
 // NewApp creates a new application instance
-// NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool) *App {
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
 		inputMessagesFile: inputMessagesFile,
@@ -102,6 +104,8 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		RulesFile:         rulesFile,
 		ConfigFile:        configFile,
 		FullMode:          fullMode,
+		HeadMode:          headMode,
+		followMode:        true,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -109,6 +113,15 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 	appInstance.updateRulesView()
 	logging.LogAppAction("New app instance created")
 	return appInstance
+}
+
+// updateMessagesPaneTitle updates the title of the messages pane based on followMode
+func (app *App) updateMessagesPaneTitle() {
+	if app.followMode {
+		app.messagesView.SetTitle("[green]Messages[-]")
+	} else {
+		app.messagesView.SetTitle("[white]Messages[-]")
+	}
 }
 
 // Run starts the application
@@ -150,36 +163,49 @@ func (app *App) runFullMode(ctx context.Context) error {
 
 // loadFullModeInitialLines loads the initial set of lines in full mode
 func (app *App) loadFullModeInitialLines(file *os.File) {
-	reader := bufio.NewReader(file)
 	app.linesMutex.Lock()
 	app.lines = []string{} // Initialize the lines slice
 	app.totalLinesInFile = 0
 	app.linesMutex.Unlock()
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			} else {
-				logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
-				app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
+	if app.HeadMode {
+		// Read the first N lines
+		reader := bufio.NewReader(file)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
+					app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
+					break
+				}
+			}
+			line = strings.TrimRight(line, "\n")
+
+			app.linesMutex.Lock()
+			app.lines = append(app.lines, line)
+			app.totalLinesInFile++ // Increment total lines
+			app.linesMutex.Unlock()
+
+			if app.totalLinesInFile >= app.InitialLines {
 				break
 			}
 		}
-		line = strings.TrimRight(line, "\n")
+	} else {
+		// Read the last N lines
+		lines, err := app.readLastNLines(app.inputMessagesFile, app.InitialLines)
+		if err != nil {
+			logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
+			app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
+			return
+		}
 
 		app.linesMutex.Lock()
-		app.lines = append(app.lines, line)
-		if len(app.lines) > app.MaxLines {
-			app.lines = app.lines[1:]
-		}
-		app.totalLinesInFile++ // Increment total lines
+		app.lines = lines
+		app.totalLinesInFile = len(lines)
 		app.linesMutex.Unlock()
-
-		app.fileMutex.Lock()
-		app.fileOffset += int64(len(line)) + 1 // +1 for newline
-		app.fileMutex.Unlock()
 	}
 
 	// Update the messagesView directly
@@ -188,6 +214,12 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 		displayText := app.applyColorRules(line)
 		app.messagesView.AddItem(displayText, "", 0, nil)
 	}
+
+	// Scroll to end if followMode is on
+	if app.followMode {
+		app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+	}
+
 	app.updateProgressBar()
 	app.updateHelpPane()
 }
@@ -237,6 +269,11 @@ func (app *App) monitorFullModeFile(ctx context.Context, file *os.File) {
 
 				app.updateProgressBar()
 				app.updateHelpPane()
+
+				// Scroll to end if followMode is on
+				if app.followMode {
+					app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+				}
 			})
 		}
 	}
@@ -363,27 +400,109 @@ func (app *App) displayInitialInputMessages() {
 	}
 	defer file.Close()
 
-	reader := bufio.NewReader(file)
-	for i := 0; i < app.InitialLines; i++ {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
-				app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
+	var lines []string
+
+	if app.HeadMode {
+		// Read the first N lines
+		reader := bufio.NewReader(file)
+		for i := 0; i < app.InitialLines; i++ {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
+					app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
+				}
+				break
 			}
-			break
+			line = strings.TrimRight(line, "\n")
+			lines = append(lines, line)
 		}
-		line = strings.TrimRight(line, "\n")
+	} else {
+		// Read the last N lines
+		lines, err = app.readLastNLines(app.inputMessagesFile, app.InitialLines)
+		if err != nil {
+			logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
+			app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
+			return
+		}
+	}
+
+	// Add lines to messagesView and app.lines
+	for _, line := range lines {
 		app.addLine(line)
 		app.messagesView.AddItem(app.applyColorRules(line), "", 0, nil)
-		app.fileMutex.Lock()
-		app.fileOffset += int64(len(line)) + 1 // +1 for newline
-		app.fileMutex.Unlock()
+	}
+
+	// Scroll to end if followMode is on
+	if app.followMode {
+		app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
 	}
 
 	// Update progress bar and help pane after initial load
 	app.updateProgressBar()
 	app.updateHelpPane()
+}
+
+// readLastNLines reads the last N lines from a file
+func (app *App) readLastNLines(filename string, n int) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf(ErrFileOpen, err)
+	}
+	defer file.Close()
+
+	var lines []string
+	var fileSize int64
+
+	// Get the file size
+	if stat, err := file.Stat(); err == nil {
+		fileSize = stat.Size()
+	} else {
+		return nil, fmt.Errorf("Error getting file size: %v", err)
+	}
+
+	var offset int64 = fileSize
+	var chunkSize int64 = 1024
+	var buf []byte
+	var lineBuffer []byte
+
+	lineCount := 0
+
+	for offset > 0 && lineCount <= n {
+		if offset < chunkSize {
+			chunkSize = offset
+			offset = 0
+		} else {
+			offset -= chunkSize
+		}
+
+		buf = make([]byte, chunkSize)
+		_, err := file.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("Error reading file: %v", err)
+		}
+
+		for i := len(buf) - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				if len(lineBuffer) > 0 {
+					lines = append([]string{string(lineBuffer)}, lines...)
+					lineBuffer = nil
+				}
+				lineCount++
+				if lineCount >= n {
+					break
+				}
+			} else {
+				lineBuffer = append([]byte{buf[i]}, lineBuffer...)
+			}
+		}
+	}
+
+	if len(lineBuffer) > 0 && lineCount < n {
+		lines = append([]string{string(lineBuffer)}, lines...)
+	}
+
+	return lines, nil
 }
 
 // setupHandlers sets up input handlers and event listeners
@@ -422,6 +541,7 @@ func (app *App) handleRuleInput(key tcell.Key) {
 	}
 }
 
+// handleGlobalInput handles global key shortcuts
 // handleGlobalInput handles global key shortcuts
 func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	// Handle global shortcuts
@@ -466,6 +586,8 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 				app.initiateSave()
 			case keyBindings["delete"]:
 				app.deleteSelected()
+			case keyBindings["follow"]:
+				app.toggleFollowMode() // Handle 'f' key to toggle follow mode
 			}
 			return nil
 		}
@@ -519,6 +641,12 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	}
 
 	return event
+}
+
+// toggleFollowMode toggles the follow mode on or off
+func (app *App) toggleFollowMode() {
+	app.followMode = !app.followMode
+	app.updateMessagesPaneTitle()
 }
 
 func (app *App) deleteSelectedRule() {
@@ -711,12 +839,13 @@ func (app *App) quit() {
 }
 
 // initUI initializes the UI components and layout
+// initUI initializes the UI components and layout
 func (app *App) initUI() {
 	// Initialize messagesView
 	app.messagesView = tview.NewList()
 	app.messagesView.ShowSecondaryText(false)
 	app.messagesView.SetBorder(true)
-	app.messagesView.SetTitle("Messages")
+	app.updateMessagesPaneTitle() // Set the initial title based on followMode
 
 	// Initialize rulesView
 	app.rulesView = tview.NewTextView()
@@ -788,13 +917,14 @@ Keybindings:
 - q: Quit
 - h: Show this help
 
-Command-line Flags:
-- -n, --num-lines: Number of initial lines to load
-- --max-lines: Maximum number of lines to keep in memory
-- -r, --rules-file: JSON file containing matching rules to load at startup
-- -c, --config-file: JSON configuration file for color rules and settings
-- --full: Load and navigate the full file without loading all lines into memory
 `
+	// Command-line Flags:
+	// - -n, --num-lines: Number of initial lines to load
+	// - --max-lines: Maximum number of lines to keep in memory
+	// - -r, --rules-file: JSON file containing matching rules to load at startup
+	// - -c, --config-file: JSON configuration file for color rules and settings
+	// - --full: Load and navigate the full file without loading all lines into memory
+
 	app.showMessage(helpContent, app.flex)
 }
 
@@ -848,6 +978,11 @@ func (app *App) tailInputMessagesFile(ctx context.Context) {
 					app.messagesView.AddItem(app.applyColorRules(line.Text), "", 0, nil)
 					app.updateProgressBar()
 					app.updateHelpPane()
+
+					// Scroll to end if followMode is on
+					if app.followMode {
+						app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+					}
 				})
 			}
 		}
