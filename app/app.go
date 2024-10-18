@@ -39,28 +39,29 @@ const (
 )
 
 // Key bindings
-// Key bindings
 var keyBindings = map[string]rune{
-	"quit":   'q',
-	"save":   's',
-	"view":   'v',
-	"delete": 'd',
-	"help":   'h',
-	"follow": 'f',
-	"search": '/',
-	"next":   'n',
+	"quit":      'q',
+	"save":      's',
+	"view":      'v',
+	"delete":    'd',
+	"help":      'h',
+	"follow":    'f',
+	"search":    '/',
+	"next":      'n',
+	"sensitive": 'c',
+	"partial":   'p',
 }
 
 // FocusState represents the current focus in the UI
 type FocusState int
 
 const (
-	FocusMessages FocusState = iota
-	FocusRuleInput
-	FocusRulesView
-	FocusSaveInput
-	FocusViewModal
-	FocusSearchInput
+	focusMessages FocusState = iota
+	focusRuleInput
+	focusRulesView
+	focusSaveInput
+	focusViewModal
+	focusSearchInput
 )
 
 // App represents the application state
@@ -107,7 +108,7 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		inputMessagesFile: inputMessagesFile,
 		rules:             []rules.Rule{},
 		colorRules:        []rules.ColorRule{},
-		currentFocus:      FocusMessages,
+		currentFocus:      focusMessages,
 		InitialLines:      initialLines,
 		MaxLines:          maxLines,
 		RulesFile:         rulesFile,
@@ -160,6 +161,8 @@ func (app *App) runFullMode(ctx context.Context) error {
 	}
 	defer file.Close()
 
+	logging.LogAppAction("Run in Full Mode")
+
 	app.fileMutex.Lock()
 	app.fileOffset = 0
 	app.fileMutex.Unlock()
@@ -203,6 +206,7 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 				break
 			}
 		}
+		logging.LogAppAction("Head Mode & Full Mode, Loaded initial lines")
 	} else {
 		// Read the last N lines
 		lines, err := app.readLastNLines(app.inputMessagesFile, app.InitialLines)
@@ -216,6 +220,8 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 		app.lines = lines
 		app.totalLinesInFile = len(lines)
 		app.linesMutex.Unlock()
+
+		logging.LogAppAction("Normal Mode & Full Mode, Loaded initial lines")
 	}
 
 	// Update the messagesView directly
@@ -299,6 +305,7 @@ func (app *App) loadConfig() {
 	} else {
 		app.initDefaultColorRules()
 	}
+	logging.LogAppAction("Colour Rules loaded")
 }
 
 // loadRules loads matching rules from the rules file
@@ -523,8 +530,8 @@ func (app *App) setupHandlers() {
 	// Handle selection change in messagesView
 	app.messagesView.SetChangedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
 		app.selectedLineIndex = index
-		app.updateProgressBar() // Update progress bar on selection change
-		app.updateHelpPane()    // Update help pane on selection change
+		app.updateProgressBar()
+		app.updateHelpPane()
 	})
 
 	// Handle selection in messagesView (on Enter key)
@@ -551,7 +558,6 @@ func (app *App) handleRuleInput(key tcell.Key) {
 	}
 }
 
-// handleGlobalInput handles global key shortcuts
 // handleGlobalInput handles global key shortcuts
 func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	// Handle global shortcuts
@@ -586,7 +592,7 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	// Handle pane-specific shortcuts
 	currentFocus := app.currentFocus
 	switch currentFocus {
-	case FocusMessages:
+	case focusMessages:
 		switch event.Key() {
 		case tcell.KeyEnter:
 			app.viewSelectedLine()
@@ -595,20 +601,16 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			switch event.Rune() {
 			case keyBindings["view"]:
 				app.viewSelectedLine()
-			case keyBindings["save"]:
-				app.initiateSave()
-			case keyBindings["delete"]:
-				app.deleteSelected()
 			case keyBindings["follow"]:
 				app.toggleFollowMode()
-			case '/':
+			case keyBindings["search"]:
 				app.initiateSearch()
-			case 'n':
+			case keyBindings["next"]:
 				app.nextSearchResult()
 			}
 			return nil
 		}
-	case FocusRulesView:
+	case focusRulesView:
 		switch event.Key() {
 		case tcell.KeyUp:
 			// Move selection up
@@ -626,34 +628,25 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
-			case 's':
+			case keyBindings["save"]:
 				app.initiateSave()
-			case 'd':
-				// Delete selected rule
+			case keyBindings["delete"]:
 				app.deleteSelectedRule()
 				return nil
-			case 'c':
-				// Toggle CaseSensitive
+			case keyBindings["sensitive"]:
 				app.toggleCaseSensitive()
 				return nil
-			case 'p':
-				// Toggle PartialMatch
+			case keyBindings["partial"]:
 				app.togglePartialMatch()
 				return nil
 			}
 		}
 
-	case FocusViewModal:
+	case focusViewModal:
 		switch event.Key() {
-		case tcell.KeyRune:
-			switch event.Rune() {
-			case keyBindings["view"]:
-				app.closeViewModal()
-				return nil
-			case keyBindings["save"]:
-				app.initiateSave()
-				return nil
-			}
+		case tcell.KeyEnter, tcell.KeyEscape:
+			app.closeViewModal()
+			return nil
 		}
 	}
 
@@ -671,7 +664,7 @@ func (app *App) initiateSearch() {
 	})
 	app.flex.AddItem(app.searchInput, 1, 0, true)
 	app.tviewApp.SetFocus(app.searchInput)
-	app.currentFocus = FocusSearchInput
+	app.currentFocus = focusSearchInput
 }
 
 // handleSearchInput handles the search input entered by the user
@@ -682,13 +675,13 @@ func (app *App) handleSearchInput() {
 		logging.LogAppAction("Search term is empty")
 		app.showMessage("Search term cannot be empty", app.flex)
 		app.tviewApp.SetFocus(app.messagesView)
-		app.currentFocus = FocusMessages
+		app.currentFocus = focusMessages
 		return
 	}
 
 	app.performSearch()
 	app.tviewApp.SetFocus(app.messagesView)
-	app.currentFocus = FocusMessages
+	app.currentFocus = focusMessages
 }
 
 // performSearch searches through the messages for the search term
@@ -743,7 +736,7 @@ func (app *App) nextSearchResult() {
 func (app *App) cancelSearch() {
 	app.flex.RemoveItem(app.searchInput)
 	app.tviewApp.SetFocus(app.messagesView)
-	app.currentFocus = FocusMessages
+	app.currentFocus = focusMessages
 	// Clear search state
 	app.searchTerm = ""
 	app.searchResults = nil
@@ -791,7 +784,7 @@ func (app *App) togglePartialMatch() {
 
 // cycleFocus cycles the UI focus between different panes
 func (app *App) cycleFocus() {
-	focusOrder := []FocusState{FocusMessages, FocusRuleInput, FocusRulesView, FocusSearchInput}
+	focusOrder := []FocusState{focusMessages, focusRuleInput, focusRulesView, focusSearchInput}
 	oldFocus := app.currentFocus
 	index := -1
 	for i, focus := range focusOrder {
@@ -802,19 +795,19 @@ func (app *App) cycleFocus() {
 	}
 	if index == -1 {
 		// Default to messages view if current focus not found
-		app.currentFocus = FocusMessages
+		app.currentFocus = focusMessages
 	} else {
 		app.currentFocus = focusOrder[(index+1)%len(focusOrder)]
 	}
 
 	switch app.currentFocus {
-	case FocusMessages:
+	case focusMessages:
 		app.tviewApp.SetFocus(app.messagesView)
-	case FocusRuleInput:
+	case focusRuleInput:
 		app.tviewApp.SetFocus(app.ruleInput)
-	case FocusRulesView:
+	case focusRulesView:
 		app.tviewApp.SetFocus(app.rulesView)
-	case FocusSearchInput:
+	case focusSearchInput:
 		app.tviewApp.SetFocus(app.searchInput)
 	}
 	logging.LogAppAction(fmt.Sprintf("Focus cycled from %d to %d", oldFocus, app.currentFocus))
@@ -822,14 +815,14 @@ func (app *App) cycleFocus() {
 
 // viewSelectedLine displays the selected line in a modal
 func (app *App) viewSelectedLine() {
-	if app.currentFocus == FocusMessages && app.selectedLineIndex < app.messagesView.GetItemCount() {
+	if app.currentFocus == focusMessages && app.selectedLineIndex < app.messagesView.GetItemCount() {
 		// Get the selected item's text
 		mainText, _ := app.messagesView.GetItemText(app.selectedLineIndex)
 		app.viewModal.Clear()
 		app.viewModal.SetText(fmt.Sprintf("[white]%s[-]", mainText))
 		app.tviewApp.SetRoot(app.viewModal, true)
 		app.tviewApp.SetFocus(app.viewModal)
-		app.currentFocus = FocusViewModal
+		app.currentFocus = focusViewModal
 		logging.LogAppAction(fmt.Sprintf("Viewed selected line: %d", app.selectedLineIndex))
 	}
 }
@@ -838,7 +831,7 @@ func (app *App) viewSelectedLine() {
 func (app *App) closeViewModal() {
 	app.tviewApp.SetRoot(app.flex, true)
 	app.tviewApp.SetFocus(app.messagesView)
-	app.currentFocus = FocusMessages
+	app.currentFocus = focusMessages
 }
 
 // initiateSave initiates the save operation by displaying the save input field
@@ -852,7 +845,7 @@ func (app *App) initiateSave() {
 	})
 	app.flex.AddItem(app.saveFilenameInput, 1, 0, true)
 	app.tviewApp.SetFocus(app.saveFilenameInput)
-	app.currentFocus = FocusSaveInput
+	app.currentFocus = focusSaveInput
 }
 
 // handleSaveInput handles the saving of log content to a file
@@ -869,7 +862,7 @@ func (app *App) handleSaveInput() {
 
 	logging.LogAppAction(fmt.Sprintf("appfocus: %v", app.currentFocus))
 	switch app.currentFocus {
-	case FocusMessages:
+	case focusMessages:
 		var contentToSave []string
 		if app.FullMode {
 			contentToSave, err = app.getFullContent()
@@ -884,9 +877,9 @@ func (app *App) handleSaveInput() {
 			app.linesMutex.Unlock()
 		}
 		err = app.saveToFile(filename, contentToSave)
-	case FocusRulesView, FocusSaveInput:
+	case focusRulesView, focusSaveInput:
 		err = app.saveRulesToFile(filename, app.rules)
-	case FocusViewModal:
+	case focusViewModal:
 		contentToSave := []string{app.viewModal.GetText(true)}
 		err = app.saveToFile(filename, contentToSave)
 	default:
@@ -926,12 +919,12 @@ func (app *App) saveRulesToFile(filename string, rules []rules.Rule) error {
 func (app *App) cancelSave() {
 	app.flex.RemoveItem(app.saveFilenameInput)
 	app.tviewApp.SetFocus(app.messagesView)
-	app.currentFocus = FocusMessages
+	app.currentFocus = focusMessages
 }
 
 // deleteSelected deletes the selected line or rule
 func (app *App) deleteSelected() {
-	if app.currentFocus == FocusMessages && app.selectedLineIndex < app.messagesView.GetItemCount() {
+	if app.currentFocus == focusMessages && app.selectedLineIndex < app.messagesView.GetItemCount() {
 		app.messagesView.RemoveItem(app.selectedLineIndex)
 		if app.FullMode {
 			// In full mode, we don't store lines in memory
@@ -946,7 +939,7 @@ func (app *App) deleteSelected() {
 		}
 		app.updateProgressBar()
 		app.updateHelpPane()
-	} else if app.currentFocus == FocusRulesView && app.selectedRuleIndex < len(app.rules) {
+	} else if app.currentFocus == focusRulesView && app.selectedRuleIndex < len(app.rules) {
 		app.rules = append(app.rules[:app.selectedRuleIndex], app.rules[app.selectedRuleIndex+1:]...)
 		if app.selectedRuleIndex >= len(app.rules) && len(app.rules) > 0 {
 			app.selectedRuleIndex = len(app.rules) - 1
@@ -1030,7 +1023,7 @@ func (app *App) initUI() {
 	// Set root and initial focus
 	app.tviewApp.SetRoot(app.flex, true)
 	app.tviewApp.SetFocus(app.messagesView)
-	app.currentFocus = FocusMessages
+	app.currentFocus = focusMessages
 }
 
 // showHelp displays the help modal with keybindings and flags
@@ -1046,16 +1039,8 @@ Keybindings:
 - /: Search
 - n: Next search result
 - q: Quit
-- h: Show this help
-
+- h, ?: Show this help
 `
-	// Command-line Flags:
-	// - -n, --num-lines: Number of initial lines to load
-	// - --max-lines: Maximum number of lines to keep in memory
-	// - -r, --rules-file: JSON file containing matching rules to load at startup
-	// - -c, --config-file: JSON configuration file for color rules and settings
-	// - --full: Load and navigate the full file without loading all lines into memory
-
 	app.showMessage(helpContent, app.flex)
 }
 
