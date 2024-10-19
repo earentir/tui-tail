@@ -16,12 +16,14 @@ func main() {
 	cliApp.Version("v version", "ttail 0.2.47")
 	cliApp.LongDesc = "A terminal-based application for viewing and filtering log files using matching rules"
 
+	cliApp.Spec = "FILE [-n --num-lines] [--max-lines] [--rules-file] [--colour-file] [--full] [--head] [--log-file]"
+
 	inputMessagesFile := cliApp.StringArg("FILE", "", "The log file to view")
 
 	initialLines := cliApp.IntOpt("n num-lines", app.DefaultInitialLines, "Number of initial lines to load")
 	maxLines := cliApp.IntOpt("max-lines", app.DefaultMaxLines, "Maximum number of lines to keep in memory")
-	rulesFile := cliApp.StringOpt("r rules-file", "", "JSON file containing matching rules to load at startup")
-	configFile := cliApp.StringOpt("c colour-file", "", "JSON configuration file for color rules and settings")
+	rulesFile := cliApp.StringOpt("rules-file", "", "JSON file containing matching rules to load at startup")
+	configFile := cliApp.StringOpt("colour-file", "", "JSON configuration file for color rules and settings")
 	fullMode := cliApp.BoolOpt("full", false, "Load and navigate the full file without loading all lines into memory")
 	headMode := cliApp.BoolOpt("head", false, "Show the first N lines of the file instead of the last N lines")
 	logFile := cliApp.StringOpt("log-file", "", "Log file path or directory to write application logs to")
