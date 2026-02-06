@@ -13,8 +13,8 @@ Features and behaviour to align with or add compared to GNU tail.
 
 ## Scope / units
 
-- [ ] **Byte-based tail** – Support last N bytes and “from byte N” (GNU `tail -c N` / `-c +N`).
-- [ ] **Start from line N** – Support “from line N to end” (GNU `tail -n +N`), i.e. skip first N−1 lines.
+- [x] **Byte-based tail** – Support last N bytes and “from byte N” (GNU `tail -c N` / `-c +N`).
+- [x] **Start from line N** – Support “from line N to end” (GNU `tail -n +N`), i.e. skip first N−1 lines.
 
 ## Multiple inputs
 

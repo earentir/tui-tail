@@ -34,6 +34,8 @@ Default config generated in /home/you/.config/ttail/ttail.json
 | Windows | `%APPDATA%\ttail\ttail.json` |
 | macOS   | `~/Library/Application Support/ttail/ttail.json` |
 
+Only options that make sense as persistent defaults are stored in config. One-shot options (per run) are not in config and use flag defaults only: `--bytes` / `-c`, `-n +N` (from line N), `--full`, `--head`, `--retry`.
+
 **Example `ttail.json`**
 
 ```json
@@ -42,12 +44,9 @@ Default config generated in /home/you/.config/ttail/ttail.json
   "max_lines": 1000,
   "rules_file": "",
   "colour_file": "",
-  "full": false,
-  "head": false,
   "log_file": "",
   "follow": false,
-  "follow_name": false,
-  "retry": false
+  "follow_name": false
 }
 ```
 
@@ -103,8 +102,9 @@ Flags that match GNU tail have a short form in parentheses.
 
 | Flag            | Short | Description |
 |-----------------|-------|-------------|
-| `--num-lines`   | `-n`  | Number of initial lines to load (default: 10) |
+| `--num-lines`   | `-n`  | Lines: `N` = last N lines, `+N` = from line N to end (same as GNU tail -n; default: 10) |
 | `--max-lines`   |       | Maximum number of lines to keep in memory (default: 1000) |
+| `--bytes`       | `-c`  | Bytes: `N` = last N bytes, `+N` = from byte N to end (same as GNU tail -c) |
 | `--rules-file`  |       | JSON file with matching rules to load at startup |
 | `--colour-file` |       | JSON file for color rules and settings |
 | `--full`        |       | Load and navigate the full file without loading all lines into memory |
@@ -120,7 +120,10 @@ Flags that match GNU tail have a short form in parentheses.
 
 ```bash
 ttail /var/log/app.log
-ttail /var/log/app.log --num-lines 100 --colour-file colour_rule_example.json
+ttail /var/log/app.log -n 100 --colour-file colour_rule_example.json
+ttail /var/log/app.log -n +100                  # from line 100 to end (like GNU tail -n +100)
+ttail /var/log/app.log -c 1024                  # last 1024 bytes
+ttail /var/log/app.log -c +100                  # from byte 100 to end
 ttail /var/log/app.log --rules-file rules.json --full
 ```
 

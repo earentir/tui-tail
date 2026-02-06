@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -101,13 +102,38 @@ type App struct {
 	Retry              bool
 	FollowName         bool
 	HeadMode           bool
+	BytesLast          int64 // last N bytes (0 = not used)
+	BytesFrom          int64 // from byte N to end (0 = not used)
+	LinesFrom          int   // from line N to end, skip first N-1 (0 = not used)
 	searchTerm         string
 	searchResults      []int
 	currentSearchIndex int
 }
 
+// parseBytesSpec parses a bytes spec like "100" (last N) or "+100" (from byte N).
+// Returns (bytesLast, bytesFrom); both 0 means line mode.
+func parseBytesSpec(s string) (bytesLast, bytesFrom int64) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0
+	}
+	if strings.HasPrefix(s, "+") {
+		n, err := strconv.ParseInt(strings.TrimPrefix(s, "+"), 10, 64)
+		if err != nil || n < 1 {
+			return 0, 0
+		}
+		return 0, n
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, 0
+	}
+	return n, 0
+}
+
 // NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int) *App {
+	bytesLast, bytesFrom := parseBytesSpec(bytesStr)
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
 		inputMessagesFile: inputMessagesFile,
@@ -124,6 +150,9 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		followMode:        follow,
 		Retry:             retry,
 		FollowName:        followName,
+		BytesLast:         bytesLast,
+		BytesFrom:         bytesFrom,
+		LinesFrom:         linesFrom,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -446,38 +475,61 @@ func (app *App) loadRulesFromFile(filename string) error {
 // displayInitialInputMessages loads the initial set of lines in normal mode
 func (app *App) displayInitialInputMessages() {
 	logging.LogAppAction("Displaying initial input messages")
-	file, err := os.Open(app.inputMessagesFile)
-	if err != nil {
-		logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))
-		app.messagesView.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
-		return
-	}
-	defer file.Close()
 
 	var lines []string
+	var err error
 
-	if app.HeadMode {
-		// Read the first N lines
-		reader := bufio.NewReader(file)
-		for i := 0; i < app.InitialLines; i++ {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err != io.EOF {
-					logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
-					app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
-				}
-				break
-			}
-			line = strings.TrimRight(line, "\n")
-			lines = append(lines, line)
-		}
-	} else {
-		// Read the last N lines
-		lines, err = app.readLastNLines(app.inputMessagesFile, app.InitialLines)
+	switch {
+	case app.BytesLast > 0:
+		lines, err = app.readLastNBytes(app.inputMessagesFile, app.BytesLast)
 		if err != nil {
-			logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
-			app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
+			logging.LogAppAction(fmt.Sprintf("Error reading last N bytes: %v", err))
+			app.messagesView.AddItem(fmt.Sprintf("Error reading last N bytes: %v", err), "", 0, nil)
 			return
+		}
+	case app.BytesFrom > 0:
+		lines, err = app.readFromByte(app.inputMessagesFile, app.BytesFrom)
+		if err != nil {
+			logging.LogAppAction(fmt.Sprintf("Error reading from byte: %v", err))
+			app.messagesView.AddItem(fmt.Sprintf("Error reading from byte: %v", err), "", 0, nil)
+			return
+		}
+	case app.LinesFrom > 0:
+		lines, err = app.readFromLineN(app.inputMessagesFile, app.LinesFrom)
+		if err != nil {
+			logging.LogAppAction(fmt.Sprintf("Error reading from line N: %v", err))
+			app.messagesView.AddItem(fmt.Sprintf("Error reading from line N: %v", err), "", 0, nil)
+			return
+		}
+	default:
+		if app.HeadMode {
+			file, openErr := os.Open(app.inputMessagesFile)
+			if openErr != nil {
+				logging.LogAppAction(fmt.Sprintf(ErrFileOpen, openErr))
+				app.messagesView.AddItem(fmt.Sprintf(ErrFileOpen, openErr), "", 0, nil)
+				return
+			}
+			reader := bufio.NewReader(file)
+			for i := 0; i < app.InitialLines; i++ {
+				line, readErr := reader.ReadString('\n')
+				if readErr != nil {
+					if readErr != io.EOF {
+						logging.LogAppAction(fmt.Sprintf(ErrFileRead, readErr))
+						app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, readErr), "", 0, nil)
+					}
+					break
+				}
+				line = strings.TrimRight(line, "\n")
+				lines = append(lines, line)
+			}
+			file.Close()
+		} else {
+			lines, err = app.readLastNLines(app.inputMessagesFile, app.InitialLines)
+			if err != nil {
+				logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
+				app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
+				return
+			}
 		}
 	}
 
@@ -556,6 +608,119 @@ func (app *App) readLastNLines(filename string, n int) ([]string, error) {
 		lines = append([]string{string(lineBuffer)}, lines...)
 	}
 
+	return lines, nil
+}
+
+// readLastNBytes reads the last n bytes from a file and splits into lines (by \n).
+func (app *App) readLastNBytes(filename string, n int64) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf(ErrFileOpen, err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat file: %w", err)
+	}
+	size := stat.Size()
+	if n > size {
+		n = size
+	}
+	if n <= 0 {
+		return []string{}, nil
+	}
+
+	_, err = file.Seek(-n, io.SeekEnd)
+	if err != nil {
+		return nil, fmt.Errorf("seek: %w", err)
+	}
+	buf := make([]byte, n)
+	read, err := io.ReadFull(file, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	buf = buf[:read]
+	return bytesToLines(buf), nil
+}
+
+// readFromByte reads from byte offset to EOF and splits into lines.
+func (app *App) readFromByte(filename string, from int64) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf(ErrFileOpen, err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat file: %w", err)
+	}
+	if from >= stat.Size() {
+		return []string{}, nil
+	}
+
+	_, err = file.Seek(from, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("seek: %w", err)
+	}
+	buf, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	return bytesToLines(buf), nil
+}
+
+// bytesToLines splits data by newline and trims \r\n from each line.
+func bytesToLines(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	raw := strings.Split(string(data), "\n")
+	lines := make([]string, 0, len(raw))
+	for _, s := range raw {
+		lines = append(lines, strings.TrimRight(s, "\r"))
+	}
+	return lines
+}
+
+// readFromLineN reads from line N (1-based) to end of file; skips first N-1 lines.
+func (app *App) readFromLineN(filename string, n int) ([]string, error) {
+	if n < 1 {
+		return nil, fmt.Errorf("lines-from must be >= 1")
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf(ErrFileOpen, err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	for i := 0; i < n-1; i++ {
+		_, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return []string{}, nil
+			}
+			return nil, fmt.Errorf("read: %w", err)
+		}
+	}
+
+	var lines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				line = strings.TrimRight(line, "\r\n")
+				if line != "" {
+					lines = append(lines, line)
+				}
+				break
+			}
+			return nil, fmt.Errorf("read: %w", err)
+		}
+		lines = append(lines, strings.TrimRight(line, "\r\n"))
+	}
 	return lines, nil
 }
 
