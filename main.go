@@ -66,12 +66,12 @@ func main() {
 	)
 
 	rootCmd := &cobra.Command{
-		Use:   "ttail [FILE]",
+		Use:   "ttail [FILE]...",
 		Short: "A tui for viewing files",
 		Long:  "A tui for viewing and filtering files using matching rules",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			inputMessagesFile := args[0]
+			inputFiles := args
 			if followName && !follow {
 				follow = true // -F implies -f (GNU tail behaviour)
 			}
@@ -93,7 +93,7 @@ func main() {
 			}
 
 			appInstance := app.NewApp(
-				inputMessagesFile,
+				inputFiles,
 				initialLines,
 				maxLines,
 				rulesFile,

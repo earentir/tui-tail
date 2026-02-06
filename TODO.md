@@ -18,7 +18,7 @@ Features and behaviour to align with or add compared to GNU tail.
 
 ## Multiple inputs
 
-- [ ] **Multiple files** – Support tailing multiple files with clear separation (e.g. headers like `==> file <==`).
+- [x] **Multiple files** – Support tailing multiple files with clear separation. Each file has a single header line (path only, same line style as other panes), no bottom border per file. Tab cycles through file regions then rule input, rules, search. Layout: N regions (1 header + 3+ content lines per file); if terminal height &lt; N×4 + 7 lines, exit with error.
 
 ## Follow-related options
 

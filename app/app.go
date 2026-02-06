@@ -25,6 +25,12 @@ import (
 	"golang.org/x/term"
 )
 
+// Multi-file layout: each file region has 1 header line + at least 3 content lines.
+const (
+	LinesPerFileRegion   = 4
+	MinNonMessagesLines = 7
+)
+
 // Constants for messages and settings
 const (
 	DefaultInitialLines = 10
@@ -68,10 +74,25 @@ const (
 	focusSearchInput
 )
 
+// FileRegion holds state for one file in multi-file mode.
+type FileRegion struct {
+	Path             string
+	Header           *tview.TextView // one-line header (path), no box border
+	List             *tview.List
+	Lines            []string
+	LinesMutex       sync.Mutex
+	TotalLinesInFile int
+	FileOffset       int64
+	FileMutex        sync.Mutex
+}
+
 // App represents the application state
 type App struct {
 	tviewApp           *tview.Application
 	messagesView       *tview.List
+	multiFileView      *tview.Flex
+	fileRegions        []*FileRegion
+	focusedRegionIndex int
 	rulesView          *tview.TextView
 	ruleInput          *tview.InputField
 	viewModal          *tview.TextView
@@ -88,6 +109,7 @@ type App struct {
 	selectedLineIndex  int
 	selectedRuleIndex  int
 	currentFocus       FocusState
+	inputFiles         []string
 	inputMessagesFile  string
 	InitialLines       int
 	MaxLines           int
@@ -136,12 +158,13 @@ func parseBytesSpec(s string) (bytesLast, bytesFrom int64) {
 	return n, 0
 }
 
-// NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool) *App {
+// NewApp creates a new application instance. inputFiles must have at least one path.
+func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool) *App {
 	bytesLast, bytesFrom := parseBytesSpec(bytesStr)
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
-		inputMessagesFile: inputMessagesFile,
+		inputFiles:        inputFiles,
+		inputMessagesFile: inputFiles[0],
 		rules:             []rules.Rule{},
 		colorRules:        []rules.ColorRule{},
 		currentFocus:      focusMessages,
@@ -172,11 +195,49 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 
 // updateMessagesPaneTitle updates the title of the messages pane based on followMode
 func (app *App) updateMessagesPaneTitle() {
+	if app.messagesView == nil {
+		return
+	}
 	if app.followMode {
 		app.messagesView.SetTitle("[green]Messages[-]")
 	} else {
 		app.messagesView.SetTitle("[white]Messages[-]")
 	}
+}
+
+// currentMessagesView returns the list widget that has focus in the messages area (single-file or focused region).
+func (app *App) currentMessagesView() *tview.List {
+	if app.messagesView != nil {
+		return app.messagesView
+	}
+	if len(app.fileRegions) > 0 && app.focusedRegionIndex >= 0 && app.focusedRegionIndex < len(app.fileRegions) {
+		return app.fileRegions[app.focusedRegionIndex].List
+	}
+	return nil
+}
+
+// currentRegion returns the focused file region in multi-file mode, or nil in single-file mode.
+func (app *App) currentRegion() *FileRegion {
+	if len(app.fileRegions) == 0 {
+		return nil
+	}
+	if app.focusedRegionIndex < 0 || app.focusedRegionIndex >= len(app.fileRegions) {
+		return nil
+	}
+	return app.fileRegions[app.focusedRegionIndex]
+}
+
+// currentLinesAndMutex returns the current lines slice and its mutex (for single-file or focused region).
+func (app *App) currentLinesAndMutex() (*[]string, *sync.Mutex) {
+	if r := app.currentRegion(); r != nil {
+		return &r.Lines, &r.LinesMutex
+	}
+	return &app.lines, &app.linesMutex
+}
+
+// isMultiFile returns true when tailing multiple files.
+func (app *App) isMultiFile() bool {
+	return len(app.inputFiles) > 1
 }
 
 // Run starts the application
@@ -186,6 +247,17 @@ func (app *App) Run() error {
 	app.cancelFunc = cancel
 	app.runCtx = ctx
 	app.setupHandlers()
+
+	// Same layout for 1 or N files: need N×4 lines
+	width, height, err := term.GetSize(int(os.Stdin.Fd()))
+	if err != nil || width <= 0 || height <= 0 {
+		return fmt.Errorf("cannot get terminal size: %w", err)
+	}
+	required := len(app.inputFiles) * LinesPerFileRegion
+	available := height - MinNonMessagesLines
+	if available < required {
+		return fmt.Errorf("cannot fit %d files: need %d lines (4 per file), only %d available; reduce number of files or increase terminal height", len(app.inputFiles), required, available)
+	}
 
 	if app.Retry {
 		if err := app.waitForFileToExist(ctx); err != nil {
@@ -199,10 +271,12 @@ func (app *App) Run() error {
 	app.displayInitialInputMessages()
 	if app.followMode {
 		app.tailStarted = true
-		if app.ZeroTerminated {
-			go app.tailInputMessagesFileZeroTerminated(ctx)
-		} else {
-			go app.tailInputMessagesFile(ctx)
+		for _, region := range app.fileRegions {
+			if app.ZeroTerminated {
+				go app.tailInputMessagesFileZeroTerminatedForRegion(ctx, region)
+			} else {
+				go app.tailInputMessagesFileForRegion(ctx, region)
+			}
 		}
 		if app.Pid > 0 {
 			go app.monitorPid(ctx)
@@ -243,56 +317,67 @@ func (app *App) lineDelim() byte {
 	return '\n'
 }
 
-// waitForFileToExist blocks until the input file exists or ctx is cancelled.
-// Used when --retry is set so we wait for the file to appear (e.g. not yet created).
+// waitForFileToExist blocks until the input file(s) exist or ctx is cancelled.
+// Used when --retry is set. For multi-file, waits for all files to exist.
 func (app *App) waitForFileToExist(ctx context.Context) error {
 	const pollInterval = 500 * time.Millisecond
+	files := app.inputFiles
 	for {
-		_, err := os.Stat(app.inputMessagesFile)
-		if err == nil {
-			return nil
+		allExist := true
+		for _, path := range files {
+			_, err := os.Stat(path)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return fmt.Errorf(ErrFileOpen, err)
+				}
+				allExist = false
+				break
+			}
 		}
-		if !os.IsNotExist(err) {
-			return fmt.Errorf(ErrFileOpen, err)
+		if allExist {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(pollInterval):
-			// keep waiting
 		}
 	}
 }
 
-// runFullMode handles the --full flag functionality
+// runFullMode handles the --full flag functionality (single file, first region).
 func (app *App) runFullMode(ctx context.Context) error {
+	if len(app.fileRegions) == 0 {
+		return fmt.Errorf("no file region")
+	}
+	region := app.fileRegions[0]
 	file, err := os.Open(app.inputMessagesFile)
 	if err != nil {
 		logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))
-		app.messagesView.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
+		region.List.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
 		return err
 	}
 	defer file.Close()
 
 	logging.LogAppAction("Run in Full Mode")
 
-	app.fileMutex.Lock()
-	app.fileOffset = 0
-	app.fileMutex.Unlock()
+	region.FileMutex.Lock()
+	region.FileOffset = 0
+	region.FileMutex.Unlock()
 
-	app.loadFullModeInitialLines(file)
+	app.loadFullModeInitialLines(file, region)
 
-	go app.monitorFullModeFile(ctx, file)
+	go app.monitorFullModeFile(ctx, file, region)
 
 	return app.tviewApp.Run()
 }
 
-// loadFullModeInitialLines loads the initial set of lines in full mode
-func (app *App) loadFullModeInitialLines(file *os.File) {
-	app.linesMutex.Lock()
-	app.lines = []string{} // Initialize the lines slice
-	app.totalLinesInFile = 0
-	app.linesMutex.Unlock()
+// loadFullModeInitialLines loads the initial set of lines in full mode into the given region.
+func (app *App) loadFullModeInitialLines(file *os.File, region *FileRegion) {
+	region.LinesMutex.Lock()
+	region.Lines = []string{}
+	region.TotalLinesInFile = 0
+	region.LinesMutex.Unlock()
 
 	if app.HeadMode {
 		delim := app.lineDelim()
@@ -304,7 +389,7 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 					break
 				}
 				logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
-				app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
+				region.List.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
 				break
 			}
 			line = strings.TrimSuffix(line, string(delim))
@@ -312,51 +397,45 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 				line = strings.TrimRight(line, "\r")
 			}
 
-			app.linesMutex.Lock()
-			app.lines = append(app.lines, line)
-			app.totalLinesInFile++
-			app.linesMutex.Unlock()
+			region.LinesMutex.Lock()
+			region.Lines = append(region.Lines, line)
+			region.TotalLinesInFile++
+			region.LinesMutex.Unlock()
 
-			if app.totalLinesInFile >= app.InitialLines {
+			if region.TotalLinesInFile >= app.InitialLines {
 				break
 			}
 		}
 		logging.LogAppAction("Head Mode & Full Mode, Loaded initial lines")
 	} else {
-		// Read the last N lines
 		lines, err := app.readLastNLines(app.inputMessagesFile, app.InitialLines, app.lineDelim())
 		if err != nil {
 			logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
-			app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
+			region.List.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
 			return
 		}
 
-		app.linesMutex.Lock()
-		app.lines = lines
-		app.totalLinesInFile = len(lines)
-		app.linesMutex.Unlock()
+		region.LinesMutex.Lock()
+		region.Lines = lines
+		region.TotalLinesInFile = len(lines)
+		region.LinesMutex.Unlock()
 
 		logging.LogAppAction("Normal Mode & Full Mode, Loaded initial lines")
 	}
 
-	// Update the messagesView directly
-	app.messagesView.Clear()
-	for _, line := range app.lines {
-		displayText := app.applyColorRules(line)
-		app.messagesView.AddItem(displayText, "", 0, nil)
+	region.List.Clear()
+	for _, line := range region.Lines {
+		region.List.AddItem(app.applyColorRules(line), "", 0, nil)
 	}
-
-	// Scroll to end if followMode is on
 	if app.followMode {
-		app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+		region.List.SetCurrentItem(region.List.GetItemCount() - 1)
 	}
-
 	app.updateProgressBar()
 	app.updateHelpPane()
 }
 
-// monitorFullModeFile monitors the file for new lines in full mode
-func (app *App) monitorFullModeFile(ctx context.Context, file *os.File) {
+// monitorFullModeFile monitors the file for new lines in full mode, updating the given region.
+func (app *App) monitorFullModeFile(ctx context.Context, file *os.File, region *FileRegion) {
 	delim := app.lineDelim()
 	reader := bufio.NewReader(file)
 	for {
@@ -379,33 +458,27 @@ func (app *App) monitorFullModeFile(ctx context.Context, file *os.File) {
 				line = strings.TrimRight(line, "\r")
 			}
 
-			app.linesMutex.Lock()
-			app.lines = append(app.lines, line)
-			if len(app.lines) > app.MaxLines {
-				app.lines = app.lines[1:]
+			region.LinesMutex.Lock()
+			region.Lines = append(region.Lines, line)
+			if len(region.Lines) > app.MaxLines {
+				region.Lines = region.Lines[1:]
 			}
-			app.totalLinesInFile++ // Increment total lines
-			app.linesMutex.Unlock()
+			region.TotalLinesInFile++
+			region.LinesMutex.Unlock()
 
-			app.fileMutex.Lock()
-			app.fileOffset += int64(len(line)) + 1
-			app.fileMutex.Unlock()
+			region.FileMutex.Lock()
+			region.FileOffset += int64(len(line)) + 1
+			region.FileMutex.Unlock()
 
 			app.tviewApp.QueueUpdateDraw(func() {
-				displayText := app.applyColorRules(line)
-				app.messagesView.AddItem(displayText, "", 0, nil)
-
-				// Remove first item if necessary
-				if app.messagesView.GetItemCount() > app.MaxLines {
-					app.messagesView.RemoveItem(0)
+				region.List.AddItem(app.applyColorRules(line), "", 0, nil)
+				if region.List.GetItemCount() > app.MaxLines {
+					region.List.RemoveItem(0)
 				}
-
 				app.updateProgressBar()
 				app.updateHelpPane()
-
-				// Scroll to end if followMode is on
 				if app.followMode {
-					app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+					region.List.SetCurrentItem(region.List.GetItemCount() - 1)
 				}
 			})
 		}
@@ -523,52 +596,42 @@ func (app *App) loadRulesFromFile(filename string) error {
 	return nil
 }
 
-// displayInitialInputMessages loads the initial set of lines in normal mode
+// displayInitialInputMessages loads the initial set of lines in normal mode.
+// Same path for 1 or N files: one header+list region per file.
 func (app *App) displayInitialInputMessages() {
 	logging.LogAppAction("Displaying initial input messages")
+	for _, region := range app.fileRegions {
+		app.displayInitialFile(region)
+	}
+	app.updateProgressBar()
+	app.updateHelpPane()
+}
 
+// displayInitialFile loads initial lines for one file into the given region (multi-file mode).
+func (app *App) displayInitialFile(region *FileRegion) {
+	path := region.Path
 	var lines []string
 	var err error
 
 	switch {
 	case app.BytesLast > 0:
-		lines, err = app.readLastNBytes(app.inputMessagesFile, app.BytesLast)
-		if err != nil {
-			logging.LogAppAction(fmt.Sprintf("Error reading last N bytes: %v", err))
-			app.messagesView.AddItem(fmt.Sprintf("Error reading last N bytes: %v", err), "", 0, nil)
-			return
-		}
+		lines, err = app.readLastNBytes(path, app.BytesLast)
 	case app.BytesFrom > 0:
-		lines, err = app.readFromByte(app.inputMessagesFile, app.BytesFrom)
-		if err != nil {
-			logging.LogAppAction(fmt.Sprintf("Error reading from byte: %v", err))
-			app.messagesView.AddItem(fmt.Sprintf("Error reading from byte: %v", err), "", 0, nil)
-			return
-		}
+		lines, err = app.readFromByte(path, app.BytesFrom)
 	case app.LinesFrom > 0:
-		lines, err = app.readFromLineN(app.inputMessagesFile, app.LinesFrom, app.lineDelim())
-		if err != nil {
-			logging.LogAppAction(fmt.Sprintf("Error reading from line N: %v", err))
-			app.messagesView.AddItem(fmt.Sprintf("Error reading from line N: %v", err), "", 0, nil)
-			return
-		}
+		lines, err = app.readFromLineN(path, app.LinesFrom, app.lineDelim())
 	default:
 		if app.HeadMode {
 			delim := app.lineDelim()
-			file, openErr := os.Open(app.inputMessagesFile)
+			file, openErr := os.Open(path)
 			if openErr != nil {
-				logging.LogAppAction(fmt.Sprintf(ErrFileOpen, openErr))
-				app.messagesView.AddItem(fmt.Sprintf(ErrFileOpen, openErr), "", 0, nil)
+				region.List.AddItem(fmt.Sprintf(ErrFileOpen, openErr), "", 0, nil)
 				return
 			}
 			reader := bufio.NewReader(file)
 			for i := 0; i < app.InitialLines; i++ {
 				line, readErr := reader.ReadString(delim)
 				if readErr != nil {
-					if readErr != io.EOF {
-						logging.LogAppAction(fmt.Sprintf(ErrFileRead, readErr))
-						app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, readErr), "", 0, nil)
-					}
 					break
 				}
 				line = strings.TrimSuffix(line, string(delim))
@@ -579,29 +642,26 @@ func (app *App) displayInitialInputMessages() {
 			}
 			file.Close()
 		} else {
-			lines, err = app.readLastNLines(app.inputMessagesFile, app.InitialLines, app.lineDelim())
-			if err != nil {
-				logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
-				app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
-				return
-			}
+			lines, err = app.readLastNLines(path, app.InitialLines, app.lineDelim())
 		}
 	}
 
-	// Add lines to messagesView and app.lines
+	if err != nil {
+		region.List.AddItem(fmt.Sprintf("Error: %v", err), "", 0, nil)
+		return
+	}
+
+	region.LinesMutex.Lock()
+	region.Lines = lines
+	region.LinesMutex.Unlock()
+
+	// Update list directly; we're still before Run() so QueueUpdateDraw would deadlock.
 	for _, line := range lines {
-		app.addLine(line)
-		app.messagesView.AddItem(app.applyColorRules(line), "", 0, nil)
+		region.List.AddItem(app.applyColorRules(line), "", 0, nil)
 	}
-
-	// Scroll to end if followMode is on
 	if app.followMode {
-		app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+		region.List.SetCurrentItem(region.List.GetItemCount() - 1)
 	}
-
-	// Update progress bar and help pane after initial load
-	app.updateProgressBar()
-	app.updateHelpPane()
 }
 
 // readLastNLines reads the last N lines (or NUL-delimited records) from a file.
@@ -790,18 +850,17 @@ func (app *App) setupHandlers() {
 	app.ruleInput.SetDoneFunc(app.handleRuleInput)
 	app.tviewApp.SetInputCapture(app.handleGlobalInput)
 
-	// Handle selection change in messagesView
-	app.messagesView.SetChangedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
-		app.selectedLineIndex = index
-		app.updateProgressBar()
-		app.updateHelpPane()
-	})
-
-	// Handle selection in messagesView (on Enter key)
-	app.messagesView.SetSelectedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
-		app.selectedLineIndex = index
-		app.viewSelectedLine()
-	})
+	if app.messagesView != nil {
+		app.messagesView.SetChangedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
+			app.selectedLineIndex = index
+			app.updateProgressBar()
+			app.updateHelpPane()
+		})
+		app.messagesView.SetSelectedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
+			app.selectedLineIndex = index
+			app.viewSelectedLine()
+		})
+	}
 }
 
 // handleRuleInput handles adding new matching rules
@@ -937,13 +996,17 @@ func (app *App) handleSearchInput() {
 	if strings.TrimSpace(app.searchTerm) == "" {
 		logging.LogAppAction("Search term is empty")
 		app.showMessage("Search term cannot be empty", app.flex)
-		app.tviewApp.SetFocus(app.messagesView)
+		if l := app.currentMessagesView(); l != nil {
+			app.tviewApp.SetFocus(l)
+		}
 		app.currentFocus = focusMessages
 		return
 	}
 
 	app.performSearch()
-	app.tviewApp.SetFocus(app.messagesView)
+	if l := app.currentMessagesView(); l != nil {
+		app.tviewApp.SetFocus(l)
+	}
 	app.currentFocus = focusMessages
 }
 
@@ -960,9 +1023,12 @@ func (app *App) performSearch() {
 		return
 	}
 
-	// Iterate through the messages to find matches
-	for i := 0; i < app.messagesView.GetItemCount(); i++ {
-		mainText, _ := app.messagesView.GetItemText(i)
+	lv := app.currentMessagesView()
+	if lv == nil {
+		return
+	}
+	for i := 0; i < lv.GetItemCount(); i++ {
+		mainText, _ := lv.GetItemText(i)
 		if regex.MatchString(mainText) {
 			app.searchResults = append(app.searchResults, i)
 		}
@@ -973,9 +1039,8 @@ func (app *App) performSearch() {
 		return
 	}
 
-	// Instead of showing a modal with the count, update the help pane
 	app.currentSearchIndex = 0
-	app.messagesView.SetCurrentItem(app.searchResults[app.currentSearchIndex])
+	lv.SetCurrentItem(app.searchResults[app.currentSearchIndex])
 	app.selectedLineIndex = app.searchResults[app.currentSearchIndex]
 	app.updateProgressBar()
 	app.updateHelpPane() // Update help pane to display search count
@@ -987,24 +1052,28 @@ func (app *App) nextSearchResult() {
 		app.showMessage("No search in progress", app.flex)
 		return
 	}
-
+	lv := app.currentMessagesView()
+	if lv == nil {
+		return
+	}
 	app.currentSearchIndex = (app.currentSearchIndex + 1) % len(app.searchResults)
-	app.messagesView.SetCurrentItem(app.searchResults[app.currentSearchIndex])
+	lv.SetCurrentItem(app.searchResults[app.currentSearchIndex])
 	app.selectedLineIndex = app.searchResults[app.currentSearchIndex]
 	app.updateProgressBar()
-	app.updateHelpPane() // Ensure help pane reflects the current state
+	app.updateHelpPane()
 }
 
 // cancelSearch cancels the search operation and returns focus to the messages view
 func (app *App) cancelSearch() {
 	app.flex.RemoveItem(app.searchInput)
-	app.tviewApp.SetFocus(app.messagesView)
+	if l := app.currentMessagesView(); l != nil {
+		app.tviewApp.SetFocus(l)
+	}
 	app.currentFocus = focusMessages
-	// Clear search state
 	app.searchTerm = ""
 	app.searchResults = nil
 	app.currentSearchIndex = 0
-	app.updateHelpPane() // Update help pane to remove search count
+	app.updateHelpPane()
 }
 
 // toggleFollowMode toggles the follow mode on or off
@@ -1053,42 +1122,61 @@ func (app *App) togglePartialMatch() {
 	app.updateRulesView()
 }
 
-// cycleFocus cycles the UI focus between different panes
+// cycleFocus cycles the UI focus between panes. With multiple files, Tab cycles through
+// each file's list first, then rule input, rules view, search.
 func (app *App) cycleFocus() {
-	focusOrder := []FocusState{focusMessages, focusRuleInput, focusRulesView, focusSearchInput}
-	oldFocus := app.currentFocus
-	index := -1
-	for i, focus := range focusOrder {
-		if focus == app.currentFocus {
-			index = i
-			break
-		}
+	nRegions := len(app.fileRegions)
+	messageSlots := 1
+	if nRegions > 0 {
+		messageSlots = nRegions
 	}
-	if index == -1 {
-		// Default to messages view if current focus not found
-		app.currentFocus = focusMessages
-	} else {
-		app.currentFocus = focusOrder[(index+1)%len(focusOrder)]
-	}
+	totalSlots := messageSlots + 3 // messages (1 or N), ruleInput, rulesView, searchInput
 
+	slot := 0
 	switch app.currentFocus {
 	case focusMessages:
-		app.tviewApp.SetFocus(app.messagesView)
+		if nRegions > 0 {
+			slot = app.focusedRegionIndex
+		} else {
+			slot = 0
+		}
 	case focusRuleInput:
-		app.tviewApp.SetFocus(app.ruleInput)
+		slot = messageSlots
 	case focusRulesView:
-		app.tviewApp.SetFocus(app.rulesView)
+		slot = messageSlots + 1
 	case focusSearchInput:
-		app.tviewApp.SetFocus(app.searchInput)
+		slot = messageSlots + 2
+	default:
+		slot = 0
 	}
-	logging.LogAppAction(fmt.Sprintf("Focus cycled from %d to %d", oldFocus, app.currentFocus))
+
+	nextSlot := (slot + 1) % totalSlots
+
+	if nextSlot < messageSlots {
+		app.currentFocus = focusMessages
+		app.focusedRegionIndex = nextSlot
+		app.tviewApp.SetFocus(app.fileRegions[nextSlot].List)
+	} else {
+		switch nextSlot - messageSlots {
+		case 0:
+			app.currentFocus = focusRuleInput
+			app.tviewApp.SetFocus(app.ruleInput)
+		case 1:
+			app.currentFocus = focusRulesView
+			app.tviewApp.SetFocus(app.rulesView)
+		case 2:
+			app.currentFocus = focusSearchInput
+			app.tviewApp.SetFocus(app.searchInput)
+		}
+	}
+	logging.LogAppAction(fmt.Sprintf("Focus cycled to slot %d", nextSlot))
 }
 
 // viewSelectedLine displays the selected line in a modal
 func (app *App) viewSelectedLine() {
-	if app.currentFocus == focusMessages && app.selectedLineIndex < app.messagesView.GetItemCount() {
-		// Get the selected item's text
-		mainText, _ := app.messagesView.GetItemText(app.selectedLineIndex)
+	lv := app.currentMessagesView()
+	if lv != nil && app.currentFocus == focusMessages && app.selectedLineIndex < lv.GetItemCount() {
+		mainText, _ := lv.GetItemText(app.selectedLineIndex)
 		app.viewModal.Clear()
 		app.viewModal.SetText(fmt.Sprintf("[white]%s[-]", mainText))
 		app.tviewApp.SetRoot(app.viewModal, true)
@@ -1101,7 +1189,9 @@ func (app *App) viewSelectedLine() {
 // closeViewModal closes the modal displaying a selected line
 func (app *App) closeViewModal() {
 	app.tviewApp.SetRoot(app.flex, true)
-	app.tviewApp.SetFocus(app.messagesView)
+	if l := app.currentMessagesView(); l != nil {
+		app.tviewApp.SetFocus(l)
+	}
 	app.currentFocus = focusMessages
 }
 
@@ -1126,6 +1216,10 @@ func (app *App) handleSaveInput() {
 	if strings.TrimSpace(filename) == "" {
 		logging.LogAppAction(MsgFilenameEmpty)
 		app.showMessage(MsgFilenameEmpty, app.flex)
+		if l := app.currentMessagesView(); l != nil {
+			app.tviewApp.SetFocus(l)
+		}
+		app.currentFocus = focusMessages
 		return
 	}
 
@@ -1143,9 +1237,10 @@ func (app *App) handleSaveInput() {
 				return
 			}
 		} else {
-			app.linesMutex.Lock()
-			contentToSave = append([]string{}, app.lines...)
-			app.linesMutex.Unlock()
+			lines, mutex := app.currentLinesAndMutex()
+			mutex.Lock()
+			contentToSave = append([]string{}, *lines...)
+			mutex.Unlock()
 		}
 		err = app.saveToFile(filename, contentToSave)
 	case focusRulesView, focusSaveInput:
@@ -1189,23 +1284,25 @@ func (app *App) saveRulesToFile(filename string, rules []rules.Rule) error {
 // cancelSave cancels the save operation and returns focus to the messages view
 func (app *App) cancelSave() {
 	app.flex.RemoveItem(app.saveFilenameInput)
-	app.tviewApp.SetFocus(app.messagesView)
+	if l := app.currentMessagesView(); l != nil {
+		app.tviewApp.SetFocus(l)
+	}
 	app.currentFocus = focusMessages
 }
 
 // deleteSelected deletes the selected line or rule
 func (app *App) deleteSelected() {
-	if app.currentFocus == focusMessages && app.selectedLineIndex < app.messagesView.GetItemCount() {
-		app.messagesView.RemoveItem(app.selectedLineIndex)
+	lv := app.currentMessagesView()
+	if lv != nil && app.currentFocus == focusMessages && app.selectedLineIndex < lv.GetItemCount() {
+		lv.RemoveItem(app.selectedLineIndex)
 		if app.FullMode {
-			// In full mode, we don't store lines in memory
-			// Deletion can be a no-op or handled differently
 			app.showMessage("Deletion not supported in full mode", app.flex)
 		} else {
-			app.linesMutex.Lock()
-			defer app.linesMutex.Unlock()
-			if app.selectedLineIndex < len(app.lines) {
-				app.lines = append(app.lines[:app.selectedLineIndex], app.lines[app.selectedLineIndex+1:]...)
+			lines, mutex := app.currentLinesAndMutex()
+			mutex.Lock()
+			defer mutex.Unlock()
+			if app.selectedLineIndex < len(*lines) {
+				*lines = append((*lines)[:app.selectedLineIndex], (*lines)[app.selectedLineIndex+1:]...)
 			}
 		}
 		app.updateProgressBar()
@@ -1225,19 +1322,108 @@ func (app *App) quit() {
 	app.tviewApp.Stop()
 }
 
-// initUI initializes the UI components and layout
-func (app *App) initUI() {
-	// Initialize messagesView
-	app.messagesView = tview.NewList()
-	app.messagesView.ShowSecondaryText(false)
-	app.messagesView.SetBorder(true)
-	app.updateMessagesPaneTitle() // Set the initial title based on followMode
+// drawHeaderLine draws full-width header: ────| Title |──── (4 dashes left, title block, fill right).
+// active=true uses ═ and titleGreen colours only the title text green (for active file).
+func drawHeaderLine(screen tcell.Screen, x, y, width int, title string, active bool, titleGreen bool) {
+	if width <= 0 {
+		return
+	}
+	bg := tview.Styles.PrimitiveBackgroundColor
+	lineCh := rune(0x2500) // ─
+	if active {
+		lineCh = rune(0x2550) // ═
+	}
+	lineStyle := tcell.StyleDefault.Foreground(tview.Styles.BorderColor).Background(bg)
+	titleCol := tview.Styles.TitleColor
+	if titleGreen {
+		titleCol = tcell.ColorGreen
+	}
+	px := x
+	for i := 0; i < 4 && px < x+width; i++ {
+		screen.SetContent(px, y, lineCh, nil, lineStyle)
+		px++
+	}
+	for _, r := range "| " {
+		if px < x+width {
+			screen.SetContent(px, y, r, nil, lineStyle)
+			px++
+		}
+	}
+	titleStart := px
+	tview.Print(screen, title, titleStart, y, width-(titleStart-x)-3, tview.AlignLeft, titleCol)
+	px = titleStart + len([]rune(title))
+	for _, r := range " |" {
+		if px < x+width {
+			screen.SetContent(px, y, r, nil, lineStyle)
+			px++
+		}
+	}
+	for px < x+width {
+		screen.SetContent(px, y, lineCh, nil, lineStyle)
+		px++
+	}
+}
 
-	// Initialize rulesView
+// initUI initializes the UI components and layout.
+// Same header+list layout for 1 or N files: ────| path |──── full width; active file uses ═ and green filename.
+func (app *App) initUI() {
+	app.multiFileView = tview.NewFlex().SetDirection(tview.FlexRow)
+	for i, path := range app.inputFiles {
+		idx := i
+		header := tview.NewTextView()
+		header.SetBorder(false)
+		header.SetDynamicColors(false)
+		header.SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
+			if width <= 0 || height <= 0 {
+				return x, y, width, height
+			}
+			selected := len(app.fileRegions) > 0 && app.focusedRegionIndex == idx
+			drawHeaderLine(screen, x, y, width, path, selected, selected)
+			return x, y + 1, width, 0
+		})
+
+		list := tview.NewList()
+		list.ShowSecondaryText(false)
+		list.SetBorder(false)
+		region := &FileRegion{Path: path, Header: header, List: list, Lines: []string{}}
+		app.fileRegions = append(app.fileRegions, region)
+
+		regionFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(header, 1, 0, false).
+			AddItem(list, 0, 1, false)
+		app.multiFileView.AddItem(regionFlex, 0, 1, false)
+
+		list.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+			app.focusedRegionIndex = idx
+			app.currentFocus = focusMessages
+			app.selectedLineIndex = index
+			app.updateProgressBar()
+			app.updateHelpPane()
+		})
+		list.SetSelectedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+			app.focusedRegionIndex = idx
+			app.currentFocus = focusMessages
+			app.selectedLineIndex = index
+			app.viewSelectedLine()
+		})
+	}
+	app.focusedRegionIndex = 0
+
+	// Initialize rulesView with same header format: ────| Matching Rules |────
 	app.rulesView = tview.NewTextView()
 	app.rulesView.SetDynamicColors(true)
-	app.rulesView.SetBorder(true)
-	app.rulesView.SetTitle("Matching Rules")
+	app.rulesView.SetBorder(false)
+	rulesHeader := tview.NewTextView()
+	rulesHeader.SetBorder(false)
+	rulesHeader.SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
+		if width > 0 && height > 0 {
+			drawHeaderLine(screen, x, y, width, "Matching Rules", false, false)
+		}
+		return x, y + 1, width, 0
+	})
+	rulesContainer := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(rulesHeader, 1, 0, false).
+		AddItem(app.rulesView, 0, 1, false)
 
 	// Initialize ruleInput
 	app.ruleInput = tview.NewInputField()
@@ -1276,16 +1462,16 @@ func (app *App) initUI() {
 	app.helpText.SetTextColor(tcell.ColorYellow)
 	app.helpText.SetText("Press 'h' for help | Line: 0 / 0") // Initial status
 
-	// Create a top FlexRow containing messagesView and rulesView side by side
+	// Create a top FlexRow containing messages area and rulesView side by side
 	topFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(app.messagesView, 0, 8, false) // Adjust the ratio as needed
+		AddItem(app.multiFileView, 0, 8, false)
 
 	// Initialize the main Flex layout with topFlex and other components stacked vertically
 	app.flex = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(topFlex, 0, 8, false).
 		AddItem(app.ruleInput, 1, 0, false).
-		AddItem(app.rulesView, 0, 2, false).         // Adjust the ratio as needed
+		AddItem(rulesContainer, 0, 2, false).
 		AddItem(app.saveFilenameInput, 0, 0, false). // Initially hidden
 		AddItem(app.searchInput, 0, 0, false).       // Initially hidden
 		AddItem(app.progressBar, 1, 0, false).
@@ -1293,7 +1479,9 @@ func (app *App) initUI() {
 
 	// Set root and initial focus
 	app.tviewApp.SetRoot(app.flex, true)
-	app.tviewApp.SetFocus(app.messagesView)
+	if app.currentMessagesView() != nil {
+		app.tviewApp.SetFocus(app.currentMessagesView())
+	}
 	app.currentFocus = focusMessages
 }
 
@@ -1470,7 +1658,7 @@ func (app *App) tailInputMessagesFile(ctx context.Context) {
 	}
 }
 
-// addLine adds a line to the buffer in normal mode
+// addLine adds a line to the buffer in normal mode (single-file).
 func (app *App) addLine(line string) {
 	if !app.FullMode {
 		app.linesMutex.Lock()
@@ -1483,12 +1671,164 @@ func (app *App) addLine(line string) {
 	}
 }
 
+// addLineToRegion adds a line to a file region's buffer (multi-file).
+func (app *App) addLineToRegion(region *FileRegion, line string) {
+	region.LinesMutex.Lock()
+	defer region.LinesMutex.Unlock()
+	region.Lines = append(region.Lines, line)
+	if len(region.Lines) > app.MaxLines {
+		region.Lines = region.Lines[len(region.Lines)-app.MaxLines:]
+	}
+}
+
+// tailInputMessagesFileForRegion tails one file and updates the given region (multi-file mode).
+func (app *App) tailInputMessagesFileForRegion(ctx context.Context, region *FileRegion) {
+	path := region.Path
+	logging.LogAppAction("Starting to tail file (multi): " + path)
+	if app.SleepInterval > 0 {
+		watch.POLL_DURATION = time.Duration(app.SleepInterval * float64(time.Second))
+	}
+	t, err := tail.TailFile(path, tail.Config{
+		Follow:    true,
+		ReOpen:    app.FollowName,
+		MustExist: !app.Retry,
+		Location:  &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd},
+		Poll:      true,
+		Logger:    tail.DiscardingLogger,
+	})
+	if err != nil {
+		logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))
+		app.tviewApp.QueueUpdateDraw(func() {
+			region.List.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
+		})
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case line, ok := <-t.Lines:
+			if !ok {
+				return
+			}
+			if line.Err != nil {
+				continue
+			}
+			if len(app.rules) == 0 || rules.MatchesAnyRule(line.Text, app.rules) {
+				app.addLineToRegion(region, line.Text)
+				app.tviewApp.QueueUpdateDraw(func() {
+					region.List.AddItem(app.applyColorRules(line.Text), "", 0, nil)
+					if region.List.GetItemCount() > app.MaxLines {
+						region.List.RemoveItem(0)
+					}
+					app.updateProgressBar()
+					app.updateHelpPane()
+					if app.followMode {
+						region.List.SetCurrentItem(region.List.GetItemCount() - 1)
+					}
+				})
+			}
+		}
+	}
+}
+
+// tailInputMessagesFileZeroTerminatedForRegion tails one file with NUL delimiter and updates the region (multi-file).
+func (app *App) tailInputMessagesFileZeroTerminatedForRegion(ctx context.Context, region *FileRegion) {
+	path := region.Path
+	logging.LogAppAction("Starting to tail file (multi, zero-term): " + path)
+	sleepDur := 100 * time.Millisecond
+	if app.SleepInterval > 0 {
+		sleepDur = time.Duration(app.SleepInterval * float64(time.Second))
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		app.tviewApp.QueueUpdateDraw(func() {
+			region.List.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
+		})
+		return
+	}
+	defer file.Close()
+
+	stat, _ := file.Stat()
+	pos := stat.Size()
+	readBuf := make([]byte, 4096)
+	var recordBuf []byte
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		stat, err := file.Stat()
+		if err != nil {
+			time.Sleep(sleepDur)
+			continue
+		}
+		size := stat.Size()
+		if size < pos {
+			pos = size
+		}
+		if size > pos {
+			_, _ = file.Seek(pos, io.SeekStart)
+			toRead := size - pos
+			if toRead > int64(len(readBuf)) {
+				toRead = int64(len(readBuf))
+			}
+			n, err := file.Read(readBuf[:toRead])
+			if err != nil && err != io.EOF {
+				time.Sleep(sleepDur)
+				continue
+			}
+			if n > 0 {
+				pos += int64(n)
+				recordBuf = append(recordBuf, readBuf[:n]...)
+				for {
+					i := 0
+					for i < len(recordBuf) && recordBuf[i] != '\x00' {
+						i++
+					}
+					if i >= len(recordBuf) {
+						break
+					}
+					record := string(recordBuf[:i])
+					recordBuf = recordBuf[i+1:]
+					if len(app.rules) == 0 || rules.MatchesAnyRule(record, app.rules) {
+						app.addLineToRegion(region, record)
+						app.tviewApp.QueueUpdateDraw(func() {
+							region.List.AddItem(app.applyColorRules(record), "", 0, nil)
+							if region.List.GetItemCount() > app.MaxLines {
+								region.List.RemoveItem(0)
+							}
+							app.updateProgressBar()
+							app.updateHelpPane()
+							if app.followMode {
+								region.List.SetCurrentItem(region.List.GetItemCount() - 1)
+							}
+						})
+					}
+				}
+			}
+		}
+		time.Sleep(sleepDur)
+	}
+}
+
 // updateMessagesView refreshes the messagesView with the current lines
 func (app *App) updateMessagesView() {
-	app.messagesView.Clear()
-	for _, line := range app.lines {
-		displayText := app.applyColorRules(line)
-		app.messagesView.AddItem(displayText, "", 0, nil)
+	lv := app.currentMessagesView()
+	if lv == nil {
+		return
+	}
+	lines, mutex := app.currentLinesAndMutex()
+	mutex.Lock()
+	ln := append([]string{}, *lines...)
+	mutex.Unlock()
+	lv.Clear()
+	for _, line := range ln {
+		lv.AddItem(app.applyColorRules(line), "", 0, nil)
 	}
 }
 
@@ -1554,15 +1894,19 @@ func (app *App) saveToFile(filename string, lines []string) error {
 func (app *App) updateProgressBar() {
 	var totalLines int
 
-	app.linesMutex.Lock()
+	lines, mutex := app.currentLinesAndMutex()
+	mutex.Lock()
 	if app.FullMode {
-		totalLines = app.totalLinesInFile
+		if r := app.currentRegion(); r != nil {
+			totalLines = r.TotalLinesInFile
+		} else {
+			totalLines = len(*lines)
+		}
 	} else {
-		// In normal mode, calculate based on number of lines
-		totalLines = len(app.lines)
+		totalLines = len(*lines)
 	}
-	currentIndex := app.selectedLineIndex + 1 // to make it 1-based
-	app.linesMutex.Unlock()
+	currentIndex := app.selectedLineIndex + 1
+	mutex.Unlock()
 
 	if totalLines == 0 {
 		app.progressBar.SetText("No logs to display")
@@ -1627,18 +1971,21 @@ func (app *App) updateProgressBar() {
 func (app *App) updateHelpPane() {
 	var currentLine, totalLines int
 
+	lines, mutex := app.currentLinesAndMutex()
+	mutex.Lock()
 	if app.FullMode {
-		app.linesMutex.Lock()
-		totalLines = app.totalLinesInFile
-		offset := app.totalLinesInFile - len(app.lines)
+		if r := app.currentRegion(); r != nil {
+			totalLines = r.TotalLinesInFile
+		} else {
+			totalLines = len(*lines)
+		}
+		offset := totalLines - len(*lines)
 		currentLine = offset + app.selectedLineIndex + 1
-		app.linesMutex.Unlock()
 	} else {
-		app.linesMutex.Lock()
-		totalLines = len(app.lines)
+		totalLines = len(*lines)
 		currentLine = app.selectedLineIndex + 1
-		app.linesMutex.Unlock()
 	}
+	mutex.Unlock()
 
 	// Clamp currentLine within [1, totalLines]
 	if currentLine < 1 {
@@ -1665,7 +2012,11 @@ func (app *App) updateHelpPane() {
 
 // getFullContent reads the entire file content for saving in full mode
 func (app *App) getFullContent() ([]string, error) {
-	file, err := os.Open(app.inputMessagesFile)
+	path := app.inputMessagesFile
+	if r := app.currentRegion(); r != nil {
+		path = r.Path
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("Error opening file: %v", err)
 	}
