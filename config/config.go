@@ -18,6 +18,7 @@ type Config struct {
 	Full       bool   `json:"full"`
 	Head       bool   `json:"head"`
 	LogFile    string `json:"log_file"`
+	Follow     bool   `json:"follow"`
 }
 
 // Default returns a config with all default values.
@@ -30,6 +31,7 @@ func Default() Config {
 		Full:       false,
 		Head:       false,
 		LogFile:    "",
+		Follow:     false,
 	}
 }
 

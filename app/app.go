@@ -94,7 +94,9 @@ type App struct {
 	fileOffset         int64
 	fileMutex          sync.Mutex
 	cancelFunc         context.CancelFunc
+	runCtx             context.Context
 	followMode         bool
+	tailStarted        bool
 	HeadMode           bool
 	searchTerm         string
 	searchResults      []int
@@ -102,7 +104,7 @@ type App struct {
 }
 
 // NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool) *App {
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
 		inputMessagesFile: inputMessagesFile,
@@ -116,7 +118,7 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		FullMode:          fullMode,
 		HeadMode:          headMode,
 		logFile:           logFile,
-		followMode:        true,
+		followMode:        follow,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -140,15 +142,18 @@ func (app *App) Run() error {
 	logging.LogAppAction("Application run started")
 	ctx, cancel := context.WithCancel(context.Background())
 	app.cancelFunc = cancel
+	app.runCtx = ctx
 	app.setupHandlers()
 
 	if app.FullMode {
 		return app.runFullMode(ctx)
-	} else {
-		app.displayInitialInputMessages()
-		go app.tailInputMessagesFile(ctx)
-		return app.tviewApp.Run()
 	}
+	app.displayInitialInputMessages()
+	if app.followMode {
+		app.tailStarted = true
+		go app.tailInputMessagesFile(ctx)
+	}
+	return app.tviewApp.Run()
 }
 
 // runFullMode handles the --full flag functionality
@@ -747,6 +752,10 @@ func (app *App) cancelSearch() {
 // toggleFollowMode toggles the follow mode on or off
 func (app *App) toggleFollowMode() {
 	app.followMode = !app.followMode
+	if app.followMode && !app.tailStarted && !app.FullMode {
+		app.tailStarted = true
+		go app.tailInputMessagesFile(app.runCtx)
+	}
 	app.updateMessagesPaneTitle()
 }
 

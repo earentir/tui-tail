@@ -44,7 +44,8 @@ Default config generated in /home/you/.config/ttail/ttail.json
   "colour_file": "",
   "full": false,
   "head": false,
-  "log_file": ""
+  "log_file": "",
+  "follow": false
 }
 ```
 
@@ -94,17 +95,20 @@ ttail [FILE] [flags]
 
 ### Flags
 
-| Flag            | Description |
-|-----------------|-------------|
-| `--num-lines`   | Number of initial lines to load (default: 10) |
-| `--max-lines`   | Maximum number of lines to keep in memory (default: 1000) |
-| `--rules-file`  | JSON file with matching rules to load at startup |
-| `--colour-file` | JSON file for color rules and settings |
-| `--full`        | Load and navigate the full file without loading all lines into memory |
-| `--head`        | Show the first N lines instead of the last N |
-| `--log-file`    | Path or directory for application logs |
-| `--help`        | Show help |
-| `--version`     | Show version |
+Flags that match GNU tail have a short form in parentheses.
+
+| Flag            | Short | Description |
+|-----------------|-------|-------------|
+| `--num-lines`   | `-n`  | Number of initial lines to load (default: 10) |
+| `--max-lines`   |       | Maximum number of lines to keep in memory (default: 1000) |
+| `--rules-file`  |       | JSON file with matching rules to load at startup |
+| `--colour-file` |       | JSON file for color rules and settings |
+| `--full`        |       | Load and navigate the full file without loading all lines into memory |
+| `--head`        |       | Show the first N lines instead of the last N |
+| `--log-file`    |       | Path or directory for application logs |
+| `--follow`      | `-f`  | Follow (tail) the file and show new lines as they are written (default: off) |
+| `--help`        |       | Show help |
+| `--version`     |       | Show version |
 
 ### Examples
 

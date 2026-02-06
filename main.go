@@ -33,6 +33,7 @@ func main() {
 		fullMode     bool
 		headMode     bool
 		logFile      string
+		follow       bool
 	)
 
 	rootCmd := &cobra.Command{
@@ -62,6 +63,7 @@ func main() {
 				fullMode,
 				headMode,
 				logFile,
+				follow,
 			)
 
 			if err := appInstance.Run(); err != nil {
@@ -75,13 +77,14 @@ func main() {
 	rootCmd.Version = appVersion
 	rootCmd.SetVersionTemplate("ttail {{.Version}}\n")
 
-	rootCmd.Flags().IntVar(&initialLines, "num-lines", cfg.NumLines, "Number of initial lines to load")
+	rootCmd.Flags().IntVarP(&initialLines, "num-lines", "n", cfg.NumLines, "Number of initial lines to load")
 	rootCmd.Flags().IntVar(&maxLines, "max-lines", cfg.MaxLines, "Maximum number of lines to keep in memory")
 	rootCmd.Flags().StringVar(&rulesFile, "rules-file", cfg.RulesFile, "JSON file containing matching rules to load at startup")
 	rootCmd.Flags().StringVar(&configFile, "colour-file", cfg.ColourFile, "JSON configuration file for color rules and settings")
 	rootCmd.Flags().BoolVar(&fullMode, "full", cfg.Full, "Load and navigate the full file without loading all lines into memory")
 	rootCmd.Flags().BoolVar(&headMode, "head", cfg.Head, "Show the first N lines of the file instead of the last N lines")
 	rootCmd.Flags().StringVar(&logFile, "log-file", cfg.LogFile, "Log file path or directory to write application logs to")
+	rootCmd.Flags().BoolVarP(&follow, "follow", "f", cfg.Follow, "Follow (tail) the file and show new lines as they are written")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
