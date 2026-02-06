@@ -1757,16 +1757,16 @@ func (app *App) initUI() {
 	app.helpText.SetDynamicColors(true)
 	app.helpText.SetBorder(false)
 	app.helpText.SetTextColor(tcell.ColorYellow)
-	app.helpText.SetText("Press 'h' for help | Line: 0 / 0")
+	app.helpText.SetText("Press 'h' for help")
 	app.helpRightText = tview.NewTextView()
 	app.helpRightText.SetDynamicColors(true)
 	app.helpRightText.SetBorder(false)
 	app.helpRightText.SetTextColor(tcell.ColorYellow)
 	app.helpRightText.SetTextAlign(tview.AlignRight)
-	app.helpRightText.SetText(app.helpRightLabel())
+	app.helpRightText.SetText(app.helpRightLabel(1, 1))
 	helpPane := tview.NewFlex().SetDirection(tview.FlexColumn).
 		AddItem(app.helpText, 0, 1, false).
-		AddItem(app.helpRightText, 20, 0, false) // "Case  roll: both"
+		AddItem(app.helpRightText, 44, 0, false) // "case | roll: both | Line: 0000007 / 0000011"
 
 	// Create a top FlexRow containing messages area and rulesView side by side
 	topFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
@@ -2201,7 +2201,7 @@ func (app *App) ruleDesc(i int) string {
 		return fmt.Sprintf("Regex: %s", rule.RegexString)
 	}
 	if rule.Text != "" {
-		return fmt.Sprintf("Text: %s, CaseSensitive: %v, PartialMatch: %v", rule.Text, rule.CaseSensitive, rule.PartialMatch)
+		return fmt.Sprintf("Text: %s, Case: %v, Partial: %v", rule.Text, rule.CaseSensitive, rule.PartialMatch)
 	}
 	return "Invalid rule (no text or regex)"
 }
@@ -2419,29 +2419,22 @@ func (app *App) updateHelpPane() {
 		currentLine = totalLines
 	}
 
-	// Update help text (left part)
+	// Left: help and optional match count
 	helpMessage := "Press 'h' for help"
-	lineStatus := fmt.Sprintf(" | Line: %d / %d", currentLine, totalLines)
-
-	// If a search is active, show the match count
 	if len(app.searchResults) > 0 {
-		searchStatus := fmt.Sprintf(" | Matches: %d", len(app.searchResults))
-		helpMessage += lineStatus + searchStatus
-	} else {
-		helpMessage += lineStatus
+		helpMessage += fmt.Sprintf(" | Matches: %d", len(app.searchResults))
 	}
-
 	app.helpText.SetText(helpMessage)
-	app.helpRightText.SetText(app.helpRightLabel())
+	app.helpRightText.SetText(app.helpRightLabel(currentLine, totalLines))
 }
 
-// helpRightLabel returns the right part of the help line: "case"/"Case" and "roll: mode".
-func (app *App) helpRightLabel() string {
+// helpRightLabel returns the right part: "case | roll: mode | Line: 0000007 / 0000011" (7 digits each, up to 1000000).
+func (app *App) helpRightLabel(currentLine, totalLines int) string {
 	caseStr := "case"
 	if app.searchCaseSensitive {
 		caseStr = "Case"
 	}
-	return caseStr + "  roll: " + app.rolloverMode
+	return fmt.Sprintf("%s | roll: %s | Line: %07d / %07d", caseStr, app.rolloverMode, currentLine, totalLines)
 }
 
 // getFullContent reads the entire file content for saving in full mode
