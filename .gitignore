@@ -27,3 +27,4 @@ go.work.sum
 ttail
 somefilewetail
 bin/*
+builds/
