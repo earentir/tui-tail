@@ -27,4 +27,4 @@ Features and behaviour to align with or add compared to GNU tail.
 
 ## Input format
 
-- [ ] **NUL-separated lines** – Support null-delimited “lines” (GNU `-z` / `--zero-terminated`).
+- [x] **NUL-separated lines** – Support null-delimited “lines” (GNU `-z` / `--zero-terminated`).

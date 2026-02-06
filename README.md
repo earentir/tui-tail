@@ -34,7 +34,7 @@ Default config generated in /home/you/.config/ttail/ttail.json
 | Windows | `%APPDATA%\ttail\ttail.json` |
 | macOS   | `~/Library/Application Support/ttail/ttail.json` |
 
-Only options that make sense as persistent defaults are stored in config. One-shot options (per run) are not in config and use flag defaults only: `--bytes` / `-c`, `-n +N` (from line N), `--full`, `--head`, `--retry`.
+Only options that make sense as persistent defaults are stored in config. One-shot options (per run) are not in config and use flag defaults only: `--bytes` / `-c`, `-n +N` (from line N), `--full`, `--head`, `--retry`, `--zero-terminated` / `-z`.
 
 **Example `ttail.json`**
 
@@ -115,6 +115,7 @@ Flags that match GNU tail have a short form in parentheses.
 | `--retry`           |       | Keep trying to open the file when it is unavailable (e.g. not yet created) |
 | `--pid`             |       | With `-f`, exit when the process with the given PID dies (GNU tail --pid; Unix) |
 | `--sleep-interval`  |       | With `-f`, poll file every N seconds (e.g. network FS); 0 = default (GNU tail -s) |
+| `--zero-terminated` | `-z`  | Input is NUL-delimited (GNU tail -z) |
 | `--help`            |       | Show help |
 | `--version`         |       | Show version |
 
@@ -128,6 +129,7 @@ ttail /var/log/app.log -c 1024                  # last 1024 bytes
 ttail /var/log/app.log -c +100                  # from byte 100 to end
 ttail /var/log/app.log -f --pid 1234           # follow and exit when process 1234 dies
 ttail /var/log/app.log -f --sleep-interval 2   # follow, poll every 2 seconds
+ttail /var/log/app.log -z file.nul              # NUL-delimited input
 ttail /var/log/app.log --rules-file rules.json --full
 ```
 

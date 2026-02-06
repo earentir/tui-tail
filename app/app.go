@@ -109,6 +109,7 @@ type App struct {
 	LinesFrom          int     // from line N to end, skip first N-1 (0 = not used)
 	Pid                int     // if > 0 and following, exit when this process dies (GNU tail --pid)
 	SleepInterval      float64 // if > 0 and following, poll file every N seconds (GNU tail -s)
+	ZeroTerminated     bool    // input is NUL-delimited (GNU tail -z)
 	searchTerm         string
 	searchResults      []int
 	currentSearchIndex int
@@ -136,7 +137,7 @@ func parseBytesSpec(s string) (bytesLast, bytesFrom int64) {
 }
 
 // NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool) *App {
 	bytesLast, bytesFrom := parseBytesSpec(bytesStr)
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
@@ -159,6 +160,7 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		LinesFrom:         linesFrom,
 		Pid:               pid,
 		SleepInterval:     sleepInterval,
+		ZeroTerminated:    zeroTerminated,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -197,7 +199,11 @@ func (app *App) Run() error {
 	app.displayInitialInputMessages()
 	if app.followMode {
 		app.tailStarted = true
-		go app.tailInputMessagesFile(ctx)
+		if app.ZeroTerminated {
+			go app.tailInputMessagesFileZeroTerminated(ctx)
+		} else {
+			go app.tailInputMessagesFile(ctx)
+		}
 		if app.Pid > 0 {
 			go app.monitorPid(ctx)
 		}
@@ -227,6 +233,14 @@ func (app *App) monitorPid(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// lineDelim returns the line delimiter for reading: '\n' or '\x00' for zero-terminated.
+func (app *App) lineDelim() byte {
+	if app.ZeroTerminated {
+		return '\x00'
+	}
+	return '\n'
 }
 
 // waitForFileToExist blocks until the input file exists or ctx is cancelled.
@@ -281,24 +295,26 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 	app.linesMutex.Unlock()
 
 	if app.HeadMode {
-		// Read the first N lines
+		delim := app.lineDelim()
 		reader := bufio.NewReader(file)
 		for {
-			line, err := reader.ReadString('\n')
+			line, err := reader.ReadString(delim)
 			if err != nil {
 				if err == io.EOF {
 					break
-				} else {
-					logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
-					app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
-					break
 				}
+				logging.LogAppAction(fmt.Sprintf(ErrFileRead, err))
+				app.messagesView.AddItem(fmt.Sprintf(ErrFileRead, err), "", 0, nil)
+				break
 			}
-			line = strings.TrimRight(line, "\n")
+			line = strings.TrimSuffix(line, string(delim))
+			if delim == '\n' {
+				line = strings.TrimRight(line, "\r")
+			}
 
 			app.linesMutex.Lock()
 			app.lines = append(app.lines, line)
-			app.totalLinesInFile++ // Increment total lines
+			app.totalLinesInFile++
 			app.linesMutex.Unlock()
 
 			if app.totalLinesInFile >= app.InitialLines {
@@ -308,7 +324,7 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 		logging.LogAppAction("Head Mode & Full Mode, Loaded initial lines")
 	} else {
 		// Read the last N lines
-		lines, err := app.readLastNLines(app.inputMessagesFile, app.InitialLines)
+		lines, err := app.readLastNLines(app.inputMessagesFile, app.InitialLines, app.lineDelim())
 		if err != nil {
 			logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
 			app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
@@ -341,6 +357,7 @@ func (app *App) loadFullModeInitialLines(file *os.File) {
 
 // monitorFullModeFile monitors the file for new lines in full mode
 func (app *App) monitorFullModeFile(ctx context.Context, file *os.File) {
+	delim := app.lineDelim()
 	reader := bufio.NewReader(file)
 	for {
 		select {
@@ -348,18 +365,19 @@ func (app *App) monitorFullModeFile(ctx context.Context, file *os.File) {
 			logging.LogAppAction("Full mode goroutine exiting")
 			return
 		default:
-			line, err := reader.ReadString('\n')
+			line, err := reader.ReadString(delim)
 			if err != nil {
 				if err == io.EOF {
-					// Wait for new data
-					continue
-				} else {
-					logging.LogAppAction(fmt.Sprintf("Error reading line: %v", err))
-					app.showMessage(fmt.Sprintf("Error reading line: %v", err), app.flex)
 					continue
 				}
+				logging.LogAppAction(fmt.Sprintf("Error reading line: %v", err))
+				app.showMessage(fmt.Sprintf("Error reading line: %v", err), app.flex)
+				continue
 			}
-			line = strings.TrimRight(line, "\n")
+			line = strings.TrimSuffix(line, string(delim))
+			if delim == '\n' {
+				line = strings.TrimRight(line, "\r")
+			}
 
 			app.linesMutex.Lock()
 			app.lines = append(app.lines, line)
@@ -528,7 +546,7 @@ func (app *App) displayInitialInputMessages() {
 			return
 		}
 	case app.LinesFrom > 0:
-		lines, err = app.readFromLineN(app.inputMessagesFile, app.LinesFrom)
+		lines, err = app.readFromLineN(app.inputMessagesFile, app.LinesFrom, app.lineDelim())
 		if err != nil {
 			logging.LogAppAction(fmt.Sprintf("Error reading from line N: %v", err))
 			app.messagesView.AddItem(fmt.Sprintf("Error reading from line N: %v", err), "", 0, nil)
@@ -536,6 +554,7 @@ func (app *App) displayInitialInputMessages() {
 		}
 	default:
 		if app.HeadMode {
+			delim := app.lineDelim()
 			file, openErr := os.Open(app.inputMessagesFile)
 			if openErr != nil {
 				logging.LogAppAction(fmt.Sprintf(ErrFileOpen, openErr))
@@ -544,7 +563,7 @@ func (app *App) displayInitialInputMessages() {
 			}
 			reader := bufio.NewReader(file)
 			for i := 0; i < app.InitialLines; i++ {
-				line, readErr := reader.ReadString('\n')
+				line, readErr := reader.ReadString(delim)
 				if readErr != nil {
 					if readErr != io.EOF {
 						logging.LogAppAction(fmt.Sprintf(ErrFileRead, readErr))
@@ -552,12 +571,15 @@ func (app *App) displayInitialInputMessages() {
 					}
 					break
 				}
-				line = strings.TrimRight(line, "\n")
+				line = strings.TrimSuffix(line, string(delim))
+				if delim == '\n' {
+					line = strings.TrimRight(line, "\r")
+				}
 				lines = append(lines, line)
 			}
 			file.Close()
 		} else {
-			lines, err = app.readLastNLines(app.inputMessagesFile, app.InitialLines)
+			lines, err = app.readLastNLines(app.inputMessagesFile, app.InitialLines, app.lineDelim())
 			if err != nil {
 				logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
 				app.messagesView.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
@@ -582,8 +604,8 @@ func (app *App) displayInitialInputMessages() {
 	app.updateHelpPane()
 }
 
-// readLastNLines reads the last N lines from a file
-func (app *App) readLastNLines(filename string, n int) ([]string, error) {
+// readLastNLines reads the last N lines (or NUL-delimited records) from a file.
+func (app *App) readLastNLines(filename string, n int, delim byte) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf(ErrFileOpen, err)
@@ -593,7 +615,6 @@ func (app *App) readLastNLines(filename string, n int) ([]string, error) {
 	var lines []string
 	var fileSize int64
 
-	// Get the file size
 	if stat, err := file.Stat(); err == nil {
 		fileSize = stat.Size()
 	} else {
@@ -604,7 +625,6 @@ func (app *App) readLastNLines(filename string, n int) ([]string, error) {
 	var chunkSize int64 = 1024
 	var buf []byte
 	var lineBuffer []byte
-
 	lineCount := 0
 
 	for offset > 0 && lineCount <= n {
@@ -622,7 +642,7 @@ func (app *App) readLastNLines(filename string, n int) ([]string, error) {
 		}
 
 		for i := len(buf) - 1; i >= 0; i-- {
-			if buf[i] == '\n' {
+			if buf[i] == delim {
 				if len(lineBuffer) > 0 {
 					lines = append([]string{string(lineBuffer)}, lines...)
 					lineBuffer = nil
@@ -674,7 +694,7 @@ func (app *App) readLastNBytes(filename string, n int64) ([]string, error) {
 		return nil, fmt.Errorf("read: %w", err)
 	}
 	buf = buf[:read]
-	return bytesToLines(buf), nil
+	return bytesToLines(buf, app.lineDelim()), nil
 }
 
 // readFromByte reads from byte offset to EOF and splits into lines.
@@ -701,24 +721,28 @@ func (app *App) readFromByte(filename string, from int64) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	return bytesToLines(buf), nil
+	return bytesToLines(buf, app.lineDelim()), nil
 }
 
-// bytesToLines splits data by newline and trims \r\n from each line.
-func bytesToLines(data []byte) []string {
+// bytesToLines splits data by the given delimiter (e.g. '\n' or '\x00').
+func bytesToLines(data []byte, delim byte) []string {
 	if len(data) == 0 {
 		return nil
 	}
-	raw := strings.Split(string(data), "\n")
+	sep := string([]byte{delim})
+	raw := strings.Split(string(data), sep)
 	lines := make([]string, 0, len(raw))
 	for _, s := range raw {
-		lines = append(lines, strings.TrimRight(s, "\r"))
+		if delim == '\n' {
+			s = strings.TrimRight(s, "\r")
+		}
+		lines = append(lines, s)
 	}
 	return lines
 }
 
-// readFromLineN reads from line N (1-based) to end of file; skips first N-1 lines.
-func (app *App) readFromLineN(filename string, n int) ([]string, error) {
+// readFromLineN reads from line N (1-based) to end of file; skips first N-1 lines/records.
+func (app *App) readFromLineN(filename string, n int, delim byte) ([]string, error) {
 	if n < 1 {
 		return nil, fmt.Errorf("lines-from must be >= 1")
 	}
@@ -730,7 +754,7 @@ func (app *App) readFromLineN(filename string, n int) ([]string, error) {
 
 	reader := bufio.NewReader(file)
 	for i := 0; i < n-1; i++ {
-		_, err := reader.ReadString('\n')
+		_, err := reader.ReadString(delim)
 		if err != nil {
 			if err == io.EOF {
 				return []string{}, nil
@@ -740,11 +764,15 @@ func (app *App) readFromLineN(filename string, n int) ([]string, error) {
 	}
 
 	var lines []string
+	trimSuffix := "\r\n"
+	if delim == '\x00' {
+		trimSuffix = "\x00"
+	}
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := reader.ReadString(delim)
 		if err != nil {
 			if err == io.EOF {
-				line = strings.TrimRight(line, "\r\n")
+				line = strings.TrimSuffix(line, trimSuffix)
 				if line != "" {
 					lines = append(lines, line)
 				}
@@ -752,7 +780,7 @@ func (app *App) readFromLineN(filename string, n int) ([]string, error) {
 			}
 			return nil, fmt.Errorf("read: %w", err)
 		}
-		lines = append(lines, strings.TrimRight(line, "\r\n"))
+		lines = append(lines, strings.TrimSuffix(line, trimSuffix))
 	}
 	return lines, nil
 }
@@ -984,7 +1012,11 @@ func (app *App) toggleFollowMode() {
 	app.followMode = !app.followMode
 	if app.followMode && !app.tailStarted && !app.FullMode {
 		app.tailStarted = true
-		go app.tailInputMessagesFile(app.runCtx)
+		if app.ZeroTerminated {
+			go app.tailInputMessagesFileZeroTerminated(app.runCtx)
+		} else {
+			go app.tailInputMessagesFile(app.runCtx)
+		}
 	}
 	app.updateMessagesPaneTitle()
 }
@@ -1293,6 +1325,96 @@ func (app *App) showMessage(message string, returnTo tview.Primitive) {
 			app.tviewApp.SetFocus(returnTo)
 		})
 	app.tviewApp.SetRoot(modal, true)
+}
+
+// tailInputMessagesFileZeroTerminated follows a file with NUL-delimited records (tail -z -f).
+// The standard tail library only supports newline; this custom loop polls and reads by \x00.
+func (app *App) tailInputMessagesFileZeroTerminated(ctx context.Context) {
+	logging.LogAppAction("Starting to tail input messages file (zero-terminated)")
+	file, err := os.Open(app.inputMessagesFile)
+	if err != nil {
+		logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))
+		log.Fatalf(ErrFileOpen, err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		logging.LogAppAction(fmt.Sprintf("Stat: %v", err))
+		return
+	}
+	pos := stat.Size()
+
+	sleepDur := 250 * time.Millisecond
+	if app.SleepInterval > 0 {
+		sleepDur = time.Duration(app.SleepInterval * float64(time.Second))
+	}
+
+	var recordBuf []byte
+	readBuf := make([]byte, 65536)
+
+	for {
+		select {
+		case <-ctx.Done():
+			logging.LogAppAction("Tail (zero-term) goroutine exiting")
+			return
+		default:
+		}
+
+		stat, err := file.Stat()
+		if err != nil {
+			time.Sleep(sleepDur)
+			continue
+		}
+		size := stat.Size()
+		if size < pos {
+			pos = size
+		}
+		if size > pos {
+			_, err := file.Seek(pos, io.SeekStart)
+			if err != nil {
+				time.Sleep(sleepDur)
+				continue
+			}
+			toRead := size - pos
+			if toRead > int64(len(readBuf)) {
+				toRead = int64(len(readBuf))
+			}
+			n, err := file.Read(readBuf[:toRead])
+			if err != nil && err != io.EOF {
+				time.Sleep(sleepDur)
+				continue
+			}
+			if n > 0 {
+				pos += int64(n)
+				recordBuf = append(recordBuf, readBuf[:n]...)
+				for {
+					i := 0
+					for i < len(recordBuf) && recordBuf[i] != '\x00' {
+						i++
+					}
+					if i >= len(recordBuf) {
+						break
+					}
+					record := string(recordBuf[:i])
+					recordBuf = recordBuf[i+1:]
+					if len(app.rules) == 0 || rules.MatchesAnyRule(record, app.rules) {
+						app.addLine(record)
+						app.tviewApp.QueueUpdateDraw(func() {
+							app.messagesView.AddItem(app.applyColorRules(record), "", 0, nil)
+							app.updateProgressBar()
+							app.updateHelpPane()
+							if app.followMode {
+								app.messagesView.SetCurrentItem(app.messagesView.GetItemCount() - 1)
+							}
+						})
+					}
+				}
+			}
+		}
+
+		time.Sleep(sleepDur)
+	}
 }
 
 // tailInputMessagesFile tails the input messages file in normal mode.

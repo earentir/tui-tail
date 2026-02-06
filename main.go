@@ -60,8 +60,9 @@ func main() {
 		followName     bool
 		retry          bool
 		bytes          string
-		pid            int
-		sleepInterval  float64
+		pid             int
+		sleepInterval   float64
+		zeroTerminated  bool
 	)
 
 	rootCmd := &cobra.Command{
@@ -107,6 +108,7 @@ func main() {
 				linesFrom,
 				pid,
 				sleepInterval,
+				zeroTerminated,
 			)
 
 			if err := appInstance.Run(); err != nil {
@@ -133,6 +135,7 @@ func main() {
 	rootCmd.Flags().BoolVar(&retry, "retry", false, "Keep trying to open the file when it is unavailable (e.g. not yet created)")
 	rootCmd.Flags().IntVar(&pid, "pid", 0, "With --follow, exit when the process with the given PID dies (GNU tail --pid)")
 	rootCmd.Flags().Float64Var(&sleepInterval, "sleep-interval", 0, "With --follow, poll file every N seconds (e.g. for network filesystems); 0 = default (GNU tail -s)")
+	rootCmd.Flags().BoolVarP(&zeroTerminated, "zero-terminated", "z", false, "Input is NUL-delimited (GNU tail -z)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
