@@ -777,6 +777,7 @@ func (app *App) displayInitialFile(region *FileRegion) {
 }
 
 // readLastNLines reads the last N lines (or NUL-delimited records) from a file.
+// Reads forward and keeps the last N lines so content and empty lines match the file exactly.
 func (app *App) readLastNLines(filename string, n int, delim byte) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -785,54 +786,31 @@ func (app *App) readLastNLines(filename string, n int, delim byte) ([]string, er
 	defer file.Close()
 
 	var lines []string
-	var fileSize int64
-
-	if stat, err := file.Stat(); err == nil {
-		fileSize = stat.Size()
-	} else {
-		return nil, fmt.Errorf("Error getting file size: %v", err)
-	}
-
-	var offset int64 = fileSize
-	var chunkSize int64 = 1024
-	var buf []byte
-	var lineBuffer []byte
-	lineCount := 0
-
-	for offset > 0 && lineCount <= n {
-		if offset < chunkSize {
-			chunkSize = offset
-			offset = 0
-		} else {
-			offset -= chunkSize
-		}
-
-		buf = make([]byte, chunkSize)
-		_, err := file.ReadAt(buf, offset)
-		if err != nil && err != io.EOF {
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadString(delim)
+		if err != nil {
+			if err == io.EOF {
+				if delim == '\n' {
+					line = strings.TrimRight(line, "\r\n")
+				} else {
+					line = strings.TrimSuffix(line, string(delim))
+				}
+				lines = append(lines, line)
+				break
+			}
 			return nil, fmt.Errorf("Error reading file: %v", err)
 		}
-
-		for i := len(buf) - 1; i >= 0; i-- {
-			if buf[i] == delim {
-				if len(lineBuffer) > 0 {
-					lines = append([]string{string(lineBuffer)}, lines...)
-					lineBuffer = nil
-				}
-				lineCount++
-				if lineCount >= n {
-					break
-				}
-			} else {
-				lineBuffer = append([]byte{buf[i]}, lineBuffer...)
-			}
+		if delim == '\n' {
+			line = strings.TrimRight(line, "\r\n")
+		} else {
+			line = strings.TrimSuffix(line, string(delim))
+		}
+		lines = append(lines, line)
+		for len(lines) > n {
+			lines = lines[1:]
 		}
 	}
-
-	if len(lineBuffer) > 0 && lineCount < n {
-		lines = append([]string{string(lineBuffer)}, lines...)
-	}
-
 	return lines, nil
 }
 
@@ -945,9 +923,7 @@ func (app *App) readFromLineN(filename string, n int, delim byte) ([]string, err
 		if err != nil {
 			if err == io.EOF {
 				line = strings.TrimSuffix(line, trimSuffix)
-				if line != "" {
-					lines = append(lines, line)
-				}
+				lines = append(lines, line)
 				break
 			}
 			return nil, fmt.Errorf("read: %w", err)
@@ -1586,6 +1562,7 @@ func (app *App) initUI() {
 		list := tview.NewList()
 		list.ShowSecondaryText(false)
 		list.SetBorder(false)
+		list.SetUseStyleTags(false, false) // Disable style tags so [brackets] display literally
 		region := &FileRegion{Path: path, Header: header, List: list, Lines: []string{}}
 		app.fileRegions = append(app.fileRegions, region)
 
@@ -2290,15 +2267,14 @@ func (app *App) getFullContent() ([]string, error) {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				if len(line) > 0 {
-					lines = append(lines, strings.TrimRight(line, "\n"))
-				}
+				line = strings.TrimRight(line, "\n")
+				lines = append(lines, line)
 				break
 			}
 			return nil, fmt.Errorf("Error reading file: %v", err)
 		}
 		line = strings.TrimRight(line, "\n")
-		lines = append(lines, app.applyColorRules(line))
+		lines = append(lines, line)
 	}
 	return lines, nil
 }
