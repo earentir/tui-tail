@@ -565,7 +565,7 @@ func (app *App) loadFullModeInitialLines(file *os.File, region *FileRegion) {
 
 	region.List.Clear()
 	for _, line := range region.Lines {
-		region.List.AddItem(app.applyColorRules(line), "", 0, nil)
+		region.List.AddItem(app.lineDisplayText(line), "", 0, nil)
 	}
 	if app.followMode {
 		region.List.SetCurrentItem(region.List.GetItemCount() - 1)
@@ -611,7 +611,7 @@ func (app *App) monitorFullModeFile(ctx context.Context, file *os.File, region *
 			region.FileMutex.Unlock()
 
 			app.tviewApp.QueueUpdateDraw(func() {
-				region.List.AddItem(app.applyColorRules(line), "", 0, nil)
+				region.List.AddItem(app.lineDisplayText(line), "", 0, nil)
 				if region.List.GetItemCount() > app.MaxLines {
 					region.List.RemoveItem(0)
 				}
@@ -797,7 +797,7 @@ func (app *App) displayInitialFile(region *FileRegion) {
 
 	// Update list directly; we're still before Run() so QueueUpdateDraw would deadlock.
 	for _, line := range lines {
-		region.List.AddItem(app.applyColorRules(line), "", 0, nil)
+		region.List.AddItem(app.lineDisplayText(line), "", 0, nil)
 	}
 	if app.followMode {
 		region.List.SetCurrentItem(region.List.GetItemCount() - 1)
@@ -1939,7 +1939,7 @@ func (app *App) tailInputMessagesFileZeroTerminated(ctx context.Context) {
 					if len(app.rules) == 0 || rules.MatchesAnyRule(record, app.rules) {
 						app.addLine(record)
 						app.tviewApp.QueueUpdateDraw(func() {
-							app.messagesView.AddItem(app.applyColorRules(record), "", 0, nil)
+							app.messagesView.AddItem(app.lineDisplayText(record), "", 0, nil)
 							app.updateProgressBar()
 							app.updateHelpPane()
 							if app.followMode {
@@ -1994,7 +1994,7 @@ func (app *App) tailInputMessagesFile(ctx context.Context) {
 			if len(app.rules) == 0 || rules.MatchesAnyRule(line.Text, app.rules) {
 				app.addLine(line.Text)
 				app.tviewApp.QueueUpdateDraw(func() {
-					app.messagesView.AddItem(app.applyColorRules(line.Text), "", 0, nil)
+					app.messagesView.AddItem(app.lineDisplayText(line.Text), "", 0, nil)
 					app.updateProgressBar()
 					app.updateHelpPane()
 
@@ -2068,7 +2068,7 @@ func (app *App) tailInputMessagesFileForRegion(ctx context.Context, region *File
 			if len(app.rules) == 0 || rules.MatchesAnyRule(line.Text, app.rules) {
 				app.addLineToRegion(region, line.Text)
 				app.tviewApp.QueueUpdateDraw(func() {
-					region.List.AddItem(app.applyColorRules(line.Text), "", 0, nil)
+					region.List.AddItem(app.lineDisplayText(line.Text), "", 0, nil)
 					if region.List.GetItemCount() > app.MaxLines {
 						region.List.RemoveItem(0)
 					}
@@ -2148,7 +2148,7 @@ func (app *App) tailInputMessagesFileZeroTerminatedForRegion(ctx context.Context
 					if len(app.rules) == 0 || rules.MatchesAnyRule(record, app.rules) {
 						app.addLineToRegion(region, record)
 						app.tviewApp.QueueUpdateDraw(func() {
-							region.List.AddItem(app.applyColorRules(record), "", 0, nil)
+							region.List.AddItem(app.lineDisplayText(record), "", 0, nil)
 							if region.List.GetItemCount() > app.MaxLines {
 								region.List.RemoveItem(0)
 							}
@@ -2178,7 +2178,7 @@ func (app *App) updateMessagesView() {
 	mutex.Unlock()
 	lv.Clear()
 	for _, line := range ln {
-		lv.AddItem(app.applyColorRules(line), "", 0, nil)
+		lv.AddItem(app.lineDisplayText(line), "", 0, nil)
 	}
 }
 
@@ -2202,6 +2202,14 @@ func (app *App) updateRulesView() {
 		fmt.Fprintf(&builder, "%s%s\n", prefix, ruleDesc)
 	}
 	app.rulesView.SetText(builder.String())
+}
+
+// lineDisplayText returns the text to show in the list for a line. Empty lines become a space so selection is visible.
+func (app *App) lineDisplayText(line string) string {
+	if strings.TrimSpace(line) == "" {
+		return " "
+	}
+	return app.applyColorRules(line)
 }
 
 // applyColorRules applies color formatting to a line based on colorRules
