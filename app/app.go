@@ -227,6 +227,7 @@ type App struct {
 	fileRegions        []*FileRegion
 	focusedRegionIndex int
 	rulesView          *tview.TextView
+	rulesContainer     *tview.Flex // header + rulesView; we resize rulesView to 0/1/2/3 lines
 	ruleInput          *tview.InputField
 	viewModal          *tview.TextView
 	saveFilenameInput  *tview.InputField
@@ -1707,9 +1708,9 @@ func (app *App) initUI() {
 		}
 		return x, y + 1, width, 0
 	})
-	rulesContainer := tview.NewFlex().SetDirection(tview.FlexRow).
+	app.rulesContainer = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(rulesHeader, 1, 0, false).
-		AddItem(app.rulesView, 0, 1, false)
+		AddItem(app.rulesView, 0, 0, false) // height 0 when no rules; resize in updateRulesView
 
 	app.rulesView.SetFocusFunc(func() {
 		app.currentFocus = focusRulesView
@@ -1776,7 +1777,7 @@ func (app *App) initUI() {
 	app.flex = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(topFlex, 0, 8, false).
-		AddItem(rulesContainer, 0, 2, false).
+		AddItem(app.rulesContainer, 1, 0, false). // fixed height; updateRulesView sets 1/2/3/4 lines
 		AddItem(app.saveFilenameInput, 0, 0, false). // Initially hidden
 		AddItem(app.progressBar, 1, 0, false).
 		AddItem(helpPane, 1, 0, false)
@@ -2182,26 +2183,87 @@ func (app *App) updateMessagesView() {
 	}
 }
 
-// updateRulesView refreshes the rulesView with the current rules
+const maxRulesLines = 3
+const maxRulesTotal = 6
+
+// padTruncateRunes pads s with spaces or truncates so it has exactly n runes.
+func padTruncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n])
+	}
+	return string(r) + strings.Repeat(" ", n-len(r))
+}
+
+func (app *App) ruleDesc(i int) string {
+	rule := app.rules[i]
+	if rule.RegexString != "" {
+		return fmt.Sprintf("Regex: %s", rule.RegexString)
+	}
+	if rule.Text != "" {
+		return fmt.Sprintf("Text: %s, CaseSensitive: %v, PartialMatch: %v", rule.Text, rule.CaseSensitive, rule.PartialMatch)
+	}
+	return "Invalid rule (no text or regex)"
+}
+
+// updateRulesView refreshes the rulesView: two columns; height 0 when no rules (header only), else 1/2/3 lines for 1–2/3–4/5–6 rules.
+// We resize both the inner rulesView and the rulesContainer in the main flex so the file view actually gets the space back.
 func (app *App) updateRulesView() {
 	app.rulesView.Clear()
+	n := len(app.rules)
+	var contentLines int   // 0, 1, 2, or 3 lines of rule content
+	var totalRulesHeight int // header (1) + contentLines => 1, 2, 3, or 4
+
+	if n == 0 {
+		app.rulesView.SetText("")
+		contentLines = 0
+		totalRulesHeight = 1 // header only
+		app.rulesContainer.ResizeItem(app.rulesView, contentLines, 0)
+		app.flex.ResizeItem(app.rulesContainer, totalRulesHeight, 0)
+		return
+	}
+
+	_, _, width, _ := app.rulesView.GetRect()
+	if width <= 0 {
+		width = 80
+	}
+	halfWidth := width / 2
+
+	rules := app.rules
+	if len(rules) > maxRulesTotal {
+		rules = rules[:maxRulesTotal]
+	}
+	rows := (len(rules) + 1) / 2
+	if rows > maxRulesLines {
+		rows = maxRulesLines
+	}
+	contentLines = rows
+	totalRulesHeight = 1 + contentLines // header + content lines
+
 	var builder strings.Builder
-	for i, rule := range app.rules {
-		prefix := ""
-		if i == app.selectedRuleIndex {
-			prefix = "[yellow]>[-] "
+	for row := 0; row < rows; row++ {
+		leftIdx := row * 2
+		rightIdx := row*2 + 1
+		leftPrefix := ""
+		if leftIdx == app.selectedRuleIndex {
+			leftPrefix = "[yellow]>[-] "
 		}
-		ruleDesc := ""
-		if rule.RegexString != "" {
-			ruleDesc = fmt.Sprintf("Regex: %s", rule.RegexString)
-		} else if rule.Text != "" {
-			ruleDesc = fmt.Sprintf("Text: %s, CaseSensitive: %v, PartialMatch: %v", rule.Text, rule.CaseSensitive, rule.PartialMatch)
-		} else {
-			ruleDesc = "Invalid rule (no text or regex)"
+		leftStr := leftPrefix + app.ruleDesc(leftIdx)
+		builder.WriteString(padTruncateRunes(leftStr, halfWidth))
+
+		if rightIdx < len(rules) {
+			rightPrefix := ""
+			if rightIdx == app.selectedRuleIndex {
+				rightPrefix = "[yellow]>[-] "
+			}
+			rightStr := rightPrefix + app.ruleDesc(rightIdx)
+			builder.WriteString(padTruncateRunes(rightStr, halfWidth))
 		}
-		fmt.Fprintf(&builder, "%s%s\n", prefix, ruleDesc)
+		builder.WriteByte('\n')
 	}
 	app.rulesView.SetText(builder.String())
+	app.rulesContainer.ResizeItem(app.rulesView, contentLines, 0)
+	app.flex.ResizeItem(app.rulesContainer, totalRulesHeight, 0)
 }
 
 // lineDisplayText returns the text to show in the list for a line. Empty lines become a space so selection is visible.
