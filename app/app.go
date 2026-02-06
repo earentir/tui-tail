@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"ttail/logging"
 	"ttail/rules"
@@ -97,6 +98,8 @@ type App struct {
 	runCtx             context.Context
 	followMode         bool
 	tailStarted        bool
+	Retry              bool
+	FollowName         bool
 	HeadMode           bool
 	searchTerm         string
 	searchResults      []int
@@ -104,7 +107,7 @@ type App struct {
 }
 
 // NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool) *App {
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
 		inputMessagesFile: inputMessagesFile,
@@ -119,6 +122,8 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		HeadMode:          headMode,
 		logFile:           logFile,
 		followMode:        follow,
+		Retry:             retry,
+		FollowName:        followName,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -145,6 +150,12 @@ func (app *App) Run() error {
 	app.runCtx = ctx
 	app.setupHandlers()
 
+	if app.Retry {
+		if err := app.waitForFileToExist(ctx); err != nil {
+			return err
+		}
+	}
+
 	if app.FullMode {
 		return app.runFullMode(ctx)
 	}
@@ -154,6 +165,27 @@ func (app *App) Run() error {
 		go app.tailInputMessagesFile(ctx)
 	}
 	return app.tviewApp.Run()
+}
+
+// waitForFileToExist blocks until the input file exists or ctx is cancelled.
+// Used when --retry is set so we wait for the file to appear (e.g. not yet created).
+func (app *App) waitForFileToExist(ctx context.Context) error {
+	const pollInterval = 500 * time.Millisecond
+	for {
+		_, err := os.Stat(app.inputMessagesFile)
+		if err == nil {
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf(ErrFileOpen, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+			// keep waiting
+		}
+	}
 }
 
 // runFullMode handles the --full flag functionality
@@ -1065,16 +1097,17 @@ func (app *App) showMessage(message string, returnTo tview.Primitive) {
 	app.tviewApp.SetRoot(modal, true)
 }
 
-// tailInputMessagesFile tails the input messages file in normal mode
+// tailInputMessagesFile tails the input messages file in normal mode.
+// ReOpen is true only when -F (follow-name) is set; otherwise follow by descriptor (GNU tail -f).
 func (app *App) tailInputMessagesFile(ctx context.Context) {
 	logging.LogAppAction("Starting to tail input messages file")
 	t, err := tail.TailFile(app.inputMessagesFile, tail.Config{
 		Follow:    true,
-		ReOpen:    true,
-		MustExist: true, // Ensure this field is set only once
+		ReOpen:    app.FollowName, // true only with -F (follow by name, reopen on rotate)
+		MustExist: !app.Retry,
 		Location:  &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd},
-		Poll:      true,                  // Use polling to ensure compatibility across platforms
-		Logger:    tail.DiscardingLogger, // Suppress tail's own logging
+		Poll:      true,
+		Logger:    tail.DiscardingLogger,
 	})
 	if err != nil {
 		logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))

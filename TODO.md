@@ -8,8 +8,8 @@ Features and behaviour to align with or add compared to GNU tail.
 
 ## Follow / rotation
 
-- [ ] **Follow by name** – Reopen the file when it is replaced (e.g. log rotate) so we keep following the same path (GNU `tail -F`). Ensure we don’t keep reading the old inode after rotation.
-- [ ] **Retry** – When the file doesn’t exist yet, keep trying to open it (GNU `--retry`) instead of failing immediately.
+- [x] **Follow by name** – Reopen the file when it is replaced (e.g. log rotate) so we keep following the same path (GNU `tail -F`). Ensure we don’t keep reading the old inode after rotation.
+- [x] **Retry** – When the file doesn’t exist yet, keep trying to open it (GNU `--retry`) instead of failing immediately.
 
 ## Scope / units
 

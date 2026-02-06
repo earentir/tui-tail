@@ -4,7 +4,7 @@ A TUI for viewing and filtering log files using matching rules.
 
 ## Features
 
-- View files with optional follow (tail) mode
+- View files with optional follow (tail) mode; use -F to follow by name (reopen on log rotation)
 - Filter lines with regex-based matching rules
 - Colour rules via JSON config (e.g. highlight ERROR, WARN, INFO)
 - Search, navigate, and save filtered content
@@ -45,11 +45,15 @@ Default config generated in /home/you/.config/ttail/ttail.json
   "full": false,
   "head": false,
   "log_file": "",
-  "follow": false
+  "follow": false,
+  "follow_name": false,
+  "retry": false
 }
 ```
 
-Command-line flags override config file values. The defaults shown in the Flags table below are the built-in defaults when no config file exists.
+Command-line flags override config file values.
+
+With `--follow` / `-f` the file is followed by descriptor (like GNU `tail -f`). With `--follow-name` / `-F` the file is followed by name (like GNU `tail -F`): if the file is replaced (e.g. by log rotation), ttail reopens it and continues following the same path. Passing `-F` implies `-f`. The defaults shown in the Flags table below are the built-in defaults when no config file exists.
 
 ### Colour rule file (`--colour-file`)
 
@@ -107,6 +111,8 @@ Flags that match GNU tail have a short form in parentheses.
 | `--head`        |       | Show the first N lines instead of the last N |
 | `--log-file`    |       | Path or directory for application logs |
 | `--follow`      | `-f`  | Follow (tail) the file and show new lines as they are written (default: off) |
+| `--follow-name` | `-F`  | Follow by name: reopen when the file is replaced (e.g. log rotate); implies `-f` |
+| `--retry`       |       | Keep trying to open the file when it is unavailable (e.g. not yet created) |
 | `--help`        |       | Show help |
 | `--version`     |       | Show version |
 

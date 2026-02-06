@@ -34,6 +34,8 @@ func main() {
 		headMode     bool
 		logFile      string
 		follow       bool
+		followName   bool
+		retry        bool
 	)
 
 	rootCmd := &cobra.Command{
@@ -43,6 +45,9 @@ func main() {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			inputMessagesFile := args[0]
+			if followName && !follow {
+				follow = true // -F implies -f (GNU tail behaviour)
+			}
 
 			// Initialize logging if logFile is provided
 			if logFile != "" {
@@ -64,6 +69,8 @@ func main() {
 				headMode,
 				logFile,
 				follow,
+				followName,
+				retry,
 			)
 
 			if err := appInstance.Run(); err != nil {
@@ -85,6 +92,8 @@ func main() {
 	rootCmd.Flags().BoolVar(&headMode, "head", cfg.Head, "Show the first N lines of the file instead of the last N lines")
 	rootCmd.Flags().StringVar(&logFile, "log-file", cfg.LogFile, "Log file path or directory to write application logs to")
 	rootCmd.Flags().BoolVarP(&follow, "follow", "f", cfg.Follow, "Follow (tail) the file and show new lines as they are written")
+	rootCmd.Flags().BoolVarP(&followName, "follow-name", "F", cfg.FollowName, "Follow by name: reopen when the file is replaced (e.g. log rotate), like GNU tail -F")
+	rootCmd.Flags().BoolVar(&retry, "retry", cfg.Retry, "Keep trying to open the file when it is unavailable (e.g. not yet created)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
