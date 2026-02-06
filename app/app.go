@@ -1662,7 +1662,7 @@ func (app *App) initUI() {
 		list := tview.NewList()
 		list.ShowSecondaryText(false)
 		list.SetBorder(false)
-		list.SetUseStyleTags(false, false) // Disable style tags so [brackets] display literally
+		list.SetUseStyleTags(true, false) // main text: interpret style tags so colour rules ([yellow], [red], etc.) work
 		region := &FileRegion{Path: path, Header: header, List: list, Lines: []string{}}
 		app.fileRegions = append(app.fileRegions, region)
 
@@ -2212,9 +2212,13 @@ func (app *App) lineDisplayText(line string) string {
 	return app.applyColorRules(line)
 }
 
-// applyColorRules applies color formatting to a line based on colorRules
+// fullwidthLeftBracket is U+FF3B ［; used so file content doesn't trigger tview style tags (we keep ASCII "[" for our [color] tags).
+const fullwidthLeftBracket = "［"
+
+// applyColorRules applies color formatting to a line based on colorRules.
+// We replace "[" in the file with ［ (fullwidth) so only our [color] and [-] tags are interpreted; ［ looks like [.
 func (app *App) applyColorRules(line string) string {
-	coloredLine := line
+	coloredLine := strings.ReplaceAll(line, "[", fullwidthLeftBracket)
 	for _, cr := range app.colorRules {
 		if cr.Regex != nil {
 			coloredLine = cr.Regex.ReplaceAllStringFunc(coloredLine, func(match string) string {
