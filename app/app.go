@@ -486,35 +486,33 @@ func (app *App) waitForFileToExist(ctx context.Context) error {
 	}
 }
 
-// runFullMode handles the --full flag functionality (single file, first region).
+// runFullMode handles the --full flag: load and follow each file into its region.
 func (app *App) runFullMode(ctx context.Context) error {
 	if len(app.fileRegions) == 0 {
 		return fmt.Errorf("no file region")
 	}
-	region := app.fileRegions[0]
-	file, err := os.Open(app.inputMessagesFile)
-	if err != nil {
-		logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))
-		region.List.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
-		return err
-	}
-	defer file.Close()
-
 	logging.LogAppAction("Run in Full Mode")
 
-	region.FileMutex.Lock()
-	region.FileOffset = 0
-	region.FileMutex.Unlock()
-
-	app.loadFullModeInitialLines(file, region)
-
-	go app.monitorFullModeFile(ctx, file, region)
+	for i, region := range app.fileRegions {
+		path := app.inputFiles[i]
+		file, err := os.Open(path)
+		if err != nil {
+			logging.LogAppAction(fmt.Sprintf(ErrFileOpen, err))
+			region.List.AddItem(fmt.Sprintf(ErrFileOpen, err), "", 0, nil)
+			continue
+		}
+		region.FileMutex.Lock()
+		region.FileOffset = 0
+		region.FileMutex.Unlock()
+		app.loadFullModeInitialLines(file, region, path)
+		go app.monitorFullModeFile(ctx, file, region)
+	}
 
 	return app.tviewApp.Run()
 }
 
 // loadFullModeInitialLines loads the initial set of lines in full mode into the given region.
-func (app *App) loadFullModeInitialLines(file *os.File, region *FileRegion) {
+func (app *App) loadFullModeInitialLines(file *os.File, region *FileRegion, path string) {
 	region.LinesMutex.Lock()
 	region.Lines = []string{}
 	region.TotalLinesInFile = 0
@@ -549,7 +547,7 @@ func (app *App) loadFullModeInitialLines(file *os.File, region *FileRegion) {
 		}
 		logging.LogAppAction("Head Mode & Full Mode, Loaded initial lines")
 	} else {
-		lines, err := app.readLastNLines(app.inputMessagesFile, app.InitialLines, app.lineDelim())
+		lines, err := app.readLastNLines(path, app.InitialLines, app.lineDelim())
 		if err != nil {
 			logging.LogAppAction(fmt.Sprintf("Error reading last N lines: %v", err))
 			region.List.AddItem(fmt.Sprintf("Error reading last N lines: %v", err), "", 0, nil)
