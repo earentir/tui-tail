@@ -60,6 +60,7 @@ var keyBindings = map[string]rune{
 	"next":      'n',
 	"sensitive": 'c',
 	"partial":   'p',
+	"addRule":   'r',
 }
 
 // FocusState represents the current focus in the UI
@@ -73,6 +74,115 @@ const (
 	focusViewModal
 	focusSearchInput
 )
+
+// overlayRoot draws the main flex full-screen and optionally a popup centered on top (half screen width).
+// The TUI stays visible; popup does not blank the background. Keys: when popup has focus target, forward to it;
+// when text popup is open, Esc runs escapeHandler; else forward to getFocus (list).
+type overlayRoot struct {
+	*tview.Box
+	flex          *tview.Flex
+	popup         tview.Primitive
+	popupFocus    tview.Primitive // when set, keys go to this (e.g. search/rule input)
+	popupHeight   int
+	getFocus      func() tview.Primitive
+	escapeHandler func() // when set, Esc calls this (for help/view line close)
+}
+
+func newOverlayRoot(flex *tview.Flex) *overlayRoot {
+	return &overlayRoot{Box: tview.NewBox(), flex: flex, popupHeight: 3}
+}
+
+func (o *overlayRoot) SetGetFocus(fn func() tview.Primitive) { o.getFocus = fn }
+func (o *overlayRoot) SetEscapeHandler(fn func())             { o.escapeHandler = fn }
+
+func (o *overlayRoot) SetPopupWithFocus(popup, focus tview.Primitive, height int) {
+	o.popup = popup
+	o.popupFocus = focus
+	if height > 0 {
+		o.popupHeight = height
+	}
+}
+
+func (o *overlayRoot) SetTextPopup(popup tview.Primitive, height int) {
+	o.popup = popup
+	o.popupFocus = nil
+	if height > 0 {
+		o.popupHeight = height
+	}
+}
+
+func (o *overlayRoot) ClearPopup() {
+	o.popup = nil
+	o.popupFocus = nil
+	o.popupHeight = 3
+}
+
+func (o *overlayRoot) HasPopup() bool { return o.popup != nil }
+
+func (o *overlayRoot) SetRect(x, y, w, h int) {
+	o.Box.SetRect(x, y, w, h)
+	o.flex.SetRect(x, y, w, h)
+	if o.popup != nil {
+		pw := w / 2
+		if pw < 40 {
+			pw = 40
+		}
+		if pw > w-4 {
+			pw = w - 4
+		}
+		ph := o.popupHeight
+		px := x + (w-pw)/2
+		py := y + (h-ph)/2
+		if py < y {
+			py = y
+		}
+		o.popup.SetRect(px, py, pw, ph)
+	}
+}
+
+func (o *overlayRoot) Draw(screen tcell.Screen) {
+	x, y, w, h := o.Box.GetRect()
+	o.flex.SetRect(x, y, w, h)
+	o.flex.Draw(screen)
+	if o.popup != nil {
+		pw := w / 2
+		if pw < 40 {
+			pw = 40
+		}
+		if pw > w-4 {
+			pw = w - 4
+		}
+		ph := o.popupHeight
+		px := x + (w-pw)/2
+		py := y + (h-ph)/2
+		if py < y {
+			py = y
+		}
+		o.popup.SetRect(px, py, pw, ph)
+		o.popup.Draw(screen)
+	}
+}
+
+func (o *overlayRoot) InputHandler() func(*tcell.EventKey, func(tview.Primitive)) {
+	return func(event *tcell.EventKey, setFocus func(tview.Primitive)) {
+		if event.Key() == tcell.KeyEscape && o.escapeHandler != nil {
+			o.escapeHandler()
+			return
+		}
+		if o.popup != nil && o.popupFocus != nil {
+			if h := o.popupFocus.InputHandler(); h != nil {
+				h(event, setFocus)
+			}
+			return
+		}
+		if o.popup == nil && o.getFocus != nil {
+			p := o.getFocus()
+			if p != nil && p.InputHandler() != nil {
+				p.InputHandler()(event, setFocus)
+			}
+		}
+	}
+}
 
 // FileRegion holds state for one file in multi-file mode.
 type FileRegion struct {
@@ -101,6 +211,8 @@ type App struct {
 	progressBar        *tview.TextView
 	helpText           *tview.TextView
 	flex               *tview.Flex
+	rootOverlay        *overlayRoot // root: flex full-screen + optional centered popup (TUI visible, half-width popup)
+	textPopupOnClose   func()       // when non-nil, Esc closes the generic text popup
 	totalLinesInFile   int
 	rules              []rules.Rule
 	colorRules         []rules.ColorRule
@@ -450,7 +562,7 @@ func (app *App) monitorFullModeFile(ctx context.Context, file *os.File, region *
 					continue
 				}
 				logging.LogAppAction(fmt.Sprintf("Error reading line: %v", err))
-				app.showMessage(fmt.Sprintf("Error reading line: %v", err), app.flex)
+				app.showMessage(fmt.Sprintf("Error reading line: %v", err), app.rootOverlay)
 				continue
 			}
 			line = strings.TrimSuffix(line, string(delim))
@@ -847,7 +959,7 @@ func (app *App) readFromLineN(filename string, n int, delim byte) ([]string, err
 
 // setupHandlers sets up input handlers and event listeners
 func (app *App) setupHandlers() {
-	app.ruleInput.SetDoneFunc(app.handleRuleInput)
+	// ruleInput DoneFunc is set in initiateAddRule (search-style show/hide)
 	app.tviewApp.SetInputCapture(app.handleGlobalInput)
 
 	if app.messagesView != nil {
@@ -863,25 +975,97 @@ func (app *App) setupHandlers() {
 	}
 }
 
-// handleRuleInput handles adding new matching rules
-func (app *App) handleRuleInput(key tcell.Key) {
-	if key == tcell.KeyEnter {
-		ruleText := app.ruleInput.GetText()
-		if ruleText != "" {
-			rule, err := rules.ParseRule(ruleText)
-			if err != nil {
-				app.showMessage(fmt.Sprintf("Error parsing rule: %v", err), app.flex)
-				return
+// clearPopup removes the current overlay popup (if any). Call after closing search/rule/text popup.
+// Leaves focus on rootOverlay so its InputHandler keeps receiving keys and forwarding to the list.
+func (app *App) clearPopup() {
+	app.rootOverlay.ClearPopup()
+	app.rootOverlay.SetEscapeHandler(nil)
+	// Do not SetFocus(list): tview only calls root.InputHandler() when root.HasFocus(), so we must keep focus on the overlay.
+}
+
+// closeAddRuleInput closes the add-rule popup.
+func (app *App) closeAddRuleInput() {
+	app.clearPopup()
+	app.currentFocus = focusMessages
+}
+
+// initiateAddRule shows a centered popup over the TUI (Enter = add, Esc = cancel). No buttons.
+func (app *App) initiateAddRule() {
+	logging.LogAppAction("Initiating add matching rule (popup)")
+	app.ruleInput.SetText("")
+	app.ruleInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			ruleText := strings.TrimSpace(app.ruleInput.GetText())
+			app.closeAddRuleInput()
+			if ruleText != "" {
+				rule, err := rules.ParseRule(ruleText)
+				if err != nil {
+					app.showMessage(fmt.Sprintf("Error parsing rule: %v", err), app.rootOverlay)
+					return
+				}
+				app.rules = append(app.rules, rule)
+				app.updateRulesView()
 			}
-			app.rules = append(app.rules, rule)
-			app.updateRulesView()
-			app.ruleInput.SetText("")
+		} else if key == tcell.KeyEscape {
+			app.closeAddRuleInput()
 		}
+	})
+	// Popup width = half screen (overlay draws it centered); field fills inside minus label
+	_, _, w, _ := app.rootOverlay.GetRect()
+	if w <= 0 {
+		w = 80
 	}
+	popupW := w / 2
+	if popupW < 40 {
+		popupW = 40
+	}
+	inner := popupW - 2 // left+right border
+	labelLen := len("Add Matching Rule: ")
+	fieldW := inner - labelLen
+	if fieldW < 5 {
+		fieldW = 5
+	}
+	app.ruleInput.SetFieldWidth(fieldW)
+	popup := tview.NewGrid().SetRows(1).SetColumns(-1).AddItem(app.ruleInput, 0, 0, 1, 1, 0, 0, true)
+	popup.SetBorder(true).SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+	app.rootOverlay.SetPopupWithFocus(popup, app.ruleInput, 3)
+	app.tviewApp.SetFocus(app.rootOverlay)
+	app.currentFocus = focusRuleInput
+}
+
+// cancelAddRule closes the add-rule input (from Escape in global handler).
+func (app *App) cancelAddRule() {
+	app.closeAddRuleInput()
 }
 
 // handleGlobalInput handles global key shortcuts
 func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
+	// Generic text popup (help, view line): only Esc closes (Enter does not)
+	if app.textPopupOnClose != nil {
+		if event.Key() == tcell.KeyEscape {
+			app.textPopupOnClose()
+			app.textPopupOnClose = nil
+			return nil
+		}
+		return nil
+	}
+	// When in search or add-rule popup, only handle Tab/Backtab/Escape; pass everything else to the input
+	if app.currentFocus == focusSearchInput || app.currentFocus == focusRuleInput {
+		switch event.Key() {
+		case tcell.KeyTab, tcell.KeyBacktab:
+			return nil
+		case tcell.KeyEscape:
+			if app.currentFocus == focusSearchInput {
+				app.cancelSearch()
+			} else {
+				app.cancelAddRule()
+			}
+			return nil
+		default:
+			return event // pass to input so user can type
+		}
+	}
+
 	// Handle global shortcuts
 	switch event.Key() {
 	case tcell.KeyTab:
@@ -893,14 +1077,15 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 		app.cycleFocus(false)
 		return nil
 	case tcell.KeyEscape:
-		if app.tviewApp.GetFocus() == app.viewModal {
-			app.closeViewModal()
-			return nil
-		} else if app.tviewApp.GetFocus() == app.saveFilenameInput {
+		if app.tviewApp.GetFocus() == app.saveFilenameInput {
 			app.cancelSave()
 			return nil
-		} else if app.tviewApp.GetFocus() == app.searchInput {
-			app.cancelSearch()
+		} else if app.currentFocus == focusSearchInput || app.currentFocus == focusRuleInput {
+			if app.currentFocus == focusSearchInput {
+				app.cancelSearch()
+			} else {
+				app.cancelAddRule()
+			}
 			return nil
 		}
 	case tcell.KeyRune:
@@ -909,7 +1094,10 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			app.showHelp()
 			return nil
 		case keyBindings["quit"]:
-			if app.tviewApp.GetFocus() != app.ruleInput && app.tviewApp.GetFocus() != app.saveFilenameInput {
+			if app.textPopupOnClose != nil {
+				return nil
+			}
+			if app.currentFocus != focusRuleInput && app.currentFocus != focusSearchInput && app.tviewApp.GetFocus() != app.saveFilenameInput {
 				app.quit()
 				return nil
 			}
@@ -934,6 +1122,8 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 				app.initiateSearch()
 			case keyBindings["next"]:
 				app.nextSearchResult()
+			case keyBindings["addRule"]:
+				app.initiateAddRule()
 			}
 			return nil
 		}
@@ -966,6 +1156,8 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			case keyBindings["partial"]:
 				app.togglePartialMatch()
 				return nil
+			case keyBindings["addRule"]:
+				app.initiateAddRule()
 			}
 		}
 
@@ -980,39 +1172,49 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	return event
 }
 
-// initiateSearch initiates the search mode by displaying the search input field
+// closeSearchInput closes the search popup.
+func (app *App) closeSearchInput() {
+	app.clearPopup()
+	app.currentFocus = focusMessages
+}
+
+// initiateSearch shows a centered popup over the TUI (Enter = search, Esc = cancel). No buttons.
 func (app *App) initiateSearch() {
-	logging.LogAppAction("Initiating search operation")
+	logging.LogAppAction("Initiating search operation (popup)")
 	app.searchInput.SetText("")
 	app.searchInput.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
-			app.handleSearchInput()
+			app.searchTerm = strings.TrimSpace(app.searchInput.GetText())
+			app.closeSearchInput()
+			if app.searchTerm != "" {
+				app.performSearch()
+				app.updateHelpPane()
+			}
+		} else if key == tcell.KeyEscape {
+			app.cancelSearch()
 		}
 	})
-	app.flex.AddItem(app.searchInput, 1, 0, true)
-	app.tviewApp.SetFocus(app.searchInput)
+	// Popup width = half screen (overlay draws it centered); field fills inside minus label
+	_, _, w, _ := app.rootOverlay.GetRect()
+	if w <= 0 {
+		w = 80
+	}
+	popupW := w / 2
+	if popupW < 40 {
+		popupW = 40
+	}
+	inner := popupW - 2
+	labelLen := len("Search: ")
+	fieldW := inner - labelLen
+	if fieldW < 5 {
+		fieldW = 5
+	}
+	app.searchInput.SetFieldWidth(fieldW)
+	popup := tview.NewGrid().SetRows(1).SetColumns(-1).AddItem(app.searchInput, 0, 0, 1, 1, 0, 0, true)
+	popup.SetBorder(true).SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+	app.rootOverlay.SetPopupWithFocus(popup, app.searchInput, 3)
+	app.tviewApp.SetFocus(app.rootOverlay)
 	app.currentFocus = focusSearchInput
-}
-
-// handleSearchInput handles the search input entered by the user
-func (app *App) handleSearchInput() {
-	app.searchTerm = app.searchInput.GetText()
-	app.flex.RemoveItem(app.searchInput)
-	if strings.TrimSpace(app.searchTerm) == "" {
-		logging.LogAppAction("Search term is empty")
-		app.showMessage("Search term cannot be empty", app.flex)
-		if l := app.currentMessagesView(); l != nil {
-			app.tviewApp.SetFocus(l)
-		}
-		app.currentFocus = focusMessages
-		return
-	}
-
-	app.performSearch()
-	if l := app.currentMessagesView(); l != nil {
-		app.tviewApp.SetFocus(l)
-	}
-	app.currentFocus = focusMessages
 }
 
 // performSearch searches through the messages for the search term
@@ -1024,7 +1226,7 @@ func (app *App) performSearch() {
 	regex, err := regexp.Compile(app.searchTerm)
 	if err != nil {
 		logging.LogAppAction(fmt.Sprintf("Invalid regex: %v", err))
-		app.showMessage(fmt.Sprintf("Invalid regex: %v", err), app.flex)
+		app.showMessage(fmt.Sprintf("Invalid regex: %v", err), app.rootOverlay)
 		return
 	}
 
@@ -1040,8 +1242,7 @@ func (app *App) performSearch() {
 	}
 
 	if len(app.searchResults) == 0 {
-		app.showMessage("No matches found", app.flex)
-		return
+		return // only jump when we have results; no extra message
 	}
 
 	app.currentSearchIndex = 0
@@ -1054,7 +1255,7 @@ func (app *App) performSearch() {
 // nextSearchResult moves to the next search result
 func (app *App) nextSearchResult() {
 	if len(app.searchResults) == 0 {
-		app.showMessage("No search in progress", app.flex)
+		app.showMessage("No search in progress", app.rootOverlay)
 		return
 	}
 	lv := app.currentMessagesView()
@@ -1068,13 +1269,9 @@ func (app *App) nextSearchResult() {
 	app.updateHelpPane()
 }
 
-// cancelSearch cancels the search operation and returns focus to the messages view
+// cancelSearch removes the search input row and clears search state (no root change).
 func (app *App) cancelSearch() {
-	app.flex.RemoveItem(app.searchInput)
-	if l := app.currentMessagesView(); l != nil {
-		app.tviewApp.SetFocus(l)
-	}
-	app.currentFocus = focusMessages
+	app.closeSearchInput()
 	app.searchTerm = ""
 	app.searchResults = nil
 	app.currentSearchIndex = 0
@@ -1128,14 +1325,14 @@ func (app *App) togglePartialMatch() {
 }
 
 // cycleFocus cycles the UI focus between panes. Tab = forward, Shift+Tab = backward.
-// Order: file lists (0..N-1), rule input, rules view — then wrap to first file (search is not in Tab cycle).
+// Order: file lists (0..N-1), rules view — then wrap to first file (rule input and search are not in Tab cycle).
 func (app *App) cycleFocus(forward bool) {
 	nRegions := len(app.fileRegions)
 	messageSlots := 1
 	if nRegions > 0 {
 		messageSlots = nRegions
 	}
-	totalSlots := messageSlots + 2 // files, rule input, rules view (no search — it's often hidden)
+	totalSlots := messageSlots + 1 // files, rules view only (rule input and search are show-on-shortcut)
 
 	slot := 0
 	switch app.currentFocus {
@@ -1145,11 +1342,11 @@ func (app *App) cycleFocus(forward bool) {
 		} else {
 			slot = 0
 		}
-	case focusRuleInput:
+	case focusRulesView:
 		slot = messageSlots
-	case focusRulesView, focusSearchInput:
-		// Search is not in cycle; from rules or search, "next" wraps to first file
-		slot = messageSlots + 1
+	case focusRuleInput, focusSearchInput:
+		// From rule/search input, "next" wraps to first file
+		slot = messageSlots
 	default:
 		slot = 0
 	}
@@ -1165,43 +1362,40 @@ func (app *App) cycleFocus(forward bool) {
 		app.currentFocus = focusMessages
 		app.focusedRegionIndex = targetSlot
 		list := app.fileRegions[targetSlot].List
-		app.tviewApp.SetFocus(list)
 		app.selectedLineIndex = list.GetCurrentItem()
 		app.updateProgressBar()
 		app.updateHelpPane()
-	} else {
-		switch targetSlot - messageSlots {
-		case 0:
-			app.currentFocus = focusRuleInput
-			app.tviewApp.SetFocus(app.ruleInput)
-		case 1:
-			app.currentFocus = focusRulesView
-			app.tviewApp.SetFocus(app.rulesView)
-		}
 	}
+	if targetSlot >= messageSlots {
+		app.currentFocus = focusRulesView
+	}
+	app.tviewApp.SetFocus(app.rootOverlay)
 	logging.LogAppAction(fmt.Sprintf("Focus cycled to slot %d", targetSlot))
 }
 
-// viewSelectedLine displays the selected line in a modal
+// viewSelectedLine displays the selected line in the same overlay popup style as Help/Search.
 func (app *App) viewSelectedLine() {
 	lv := app.currentMessagesView()
-	if lv != nil && app.currentFocus == focusMessages && app.selectedLineIndex < lv.GetItemCount() {
-		mainText, _ := lv.GetItemText(app.selectedLineIndex)
-		app.viewModal.Clear()
-		app.viewModal.SetText(fmt.Sprintf("[white]%s[-]", mainText))
-		app.tviewApp.SetRoot(app.viewModal, true)
-		app.tviewApp.SetFocus(app.viewModal)
-		app.currentFocus = focusViewModal
-		logging.LogAppAction(fmt.Sprintf("Viewed selected line: %d", app.selectedLineIndex))
+	if lv == nil || app.currentFocus != focusMessages || app.selectedLineIndex >= lv.GetItemCount() {
+		return
 	}
+	mainText, _ := lv.GetItemText(app.selectedLineIndex)
+	body := fmt.Sprintf("[white]%s[-]", mainText)
+	app.showTextPopup("View Line", body, 5, func() { // 5 lines so wrapped text has room
+		app.clearPopup()
+		app.textPopupOnClose = nil
+	})
+	logging.LogAppAction(fmt.Sprintf("Viewed selected line: %d", app.selectedLineIndex))
 }
 
-// closeViewModal closes the modal displaying a selected line
+// closeViewModal closes the text popup if open (Esc handling).
 func (app *App) closeViewModal() {
-	app.tviewApp.SetRoot(app.flex, true)
-	if l := app.currentMessagesView(); l != nil {
-		app.tviewApp.SetFocus(l)
+	if app.textPopupOnClose != nil {
+		app.textPopupOnClose()
+		app.textPopupOnClose = nil
 	}
+	app.clearPopup()
+	app.tviewApp.SetFocus(app.rootOverlay)
 	app.currentFocus = focusMessages
 }
 
@@ -1225,10 +1419,8 @@ func (app *App) handleSaveInput() {
 	app.flex.RemoveItem(app.saveFilenameInput)
 	if strings.TrimSpace(filename) == "" {
 		logging.LogAppAction(MsgFilenameEmpty)
-		app.showMessage(MsgFilenameEmpty, app.flex)
-		if l := app.currentMessagesView(); l != nil {
-			app.tviewApp.SetFocus(l)
-		}
+		app.showMessage(MsgFilenameEmpty, app.rootOverlay)
+		app.tviewApp.SetFocus(app.rootOverlay)
 		app.currentFocus = focusMessages
 		return
 	}
@@ -1243,7 +1435,7 @@ func (app *App) handleSaveInput() {
 			contentToSave, err = app.getFullContent()
 			if err != nil {
 				logging.LogAppAction(fmt.Sprintf("Error getting full content: %v", err))
-				app.showMessage(fmt.Sprintf("Error getting full content: %v", err), app.flex)
+				app.showMessage(fmt.Sprintf("Error getting full content: %v", err), app.rootOverlay)
 				return
 			}
 		} else {
@@ -1260,16 +1452,16 @@ func (app *App) handleSaveInput() {
 		err = app.saveToFile(filename, contentToSave)
 	default:
 		logging.LogAppAction(MsgInvalidContext)
-		app.showMessage(MsgInvalidContext, app.flex)
+		app.showMessage(MsgInvalidContext, app.rootOverlay)
 		return
 	}
 
 	if err != nil {
 		logging.LogAppAction(fmt.Sprintf(ErrFileWrite, err))
-		app.showMessage(fmt.Sprintf(ErrFileWrite, err), app.flex)
+		app.showMessage(fmt.Sprintf(ErrFileWrite, err), app.rootOverlay)
 	} else {
 		logging.LogAppAction(fmt.Sprintf(MsgFileSaved, filename))
-		app.showMessage(fmt.Sprintf(MsgFileSaved, filename), app.flex)
+		app.showMessage(fmt.Sprintf(MsgFileSaved, filename), app.rootOverlay)
 	}
 }
 
@@ -1291,12 +1483,10 @@ func (app *App) saveRulesToFile(filename string, rules []rules.Rule) error {
 	return nil
 }
 
-// cancelSave cancels the save operation and returns focus to the messages view
+// cancelSave cancels the save operation and returns focus to the overlay (arrow keys work again).
 func (app *App) cancelSave() {
 	app.flex.RemoveItem(app.saveFilenameInput)
-	if l := app.currentMessagesView(); l != nil {
-		app.tviewApp.SetFocus(l)
-	}
+	app.tviewApp.SetFocus(app.rootOverlay)
 	app.currentFocus = focusMessages
 }
 
@@ -1306,7 +1496,7 @@ func (app *App) deleteSelected() {
 	if lv != nil && app.currentFocus == focusMessages && app.selectedLineIndex < lv.GetItemCount() {
 		lv.RemoveItem(app.selectedLineIndex)
 		if app.FullMode {
-			app.showMessage("Deletion not supported in full mode", app.flex)
+			app.showMessage("Deletion not supported in full mode", app.rootOverlay)
 		} else {
 			lines, mutex := app.currentLinesAndMutex()
 			mutex.Lock()
@@ -1496,32 +1686,64 @@ func (app *App) initUI() {
 		AddItem(app.multiFileView, 0, 8, false)
 
 	// Initialize the main Flex layout with topFlex and other components stacked vertically
+	// ruleInput and searchInput are shown as popups on 'r' and '/', not in the layout
 	app.flex = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(topFlex, 0, 8, false).
-		AddItem(app.ruleInput, 1, 0, false).
 		AddItem(rulesContainer, 0, 2, false).
 		AddItem(app.saveFilenameInput, 0, 0, false). // Initially hidden
-		AddItem(app.searchInput, 0, 0, false).       // Initially hidden
 		AddItem(app.progressBar, 1, 0, false).
-		AddItem(app.helpText, 1, 0, false) // Existing help pane
+		AddItem(app.helpText, 1, 0, false)          // Existing help pane
 
-	// Set root and initial focus
-	app.tviewApp.SetRoot(app.flex, true)
-	if app.currentMessagesView() != nil {
-		app.tviewApp.SetFocus(app.currentMessagesView())
-		// Sync focused region and progress in case SetRoot gave focus to another list first (e.g. last)
-		if len(app.fileRegions) > 0 {
-			app.focusedRegionIndex = 0
-			app.selectedLineIndex = app.fileRegions[0].List.GetCurrentItem()
-			app.updateProgressBar()
-			app.updateHelpPane()
+	// Root is overlay: flex full-screen, popup (when shown) centered at half screen width; TUI stays visible.
+	app.rootOverlay = newOverlayRoot(app.flex)
+	app.rootOverlay.SetGetFocus(func() tview.Primitive {
+		if l := app.currentMessagesView(); l != nil {
+			return l
 		}
+		if app.currentFocus == focusRulesView {
+			return app.rulesView
+		}
+		return app.flex
+	})
+	app.tviewApp.SetRoot(app.rootOverlay, true)
+	// Keep focus on the overlay so tview calls overlay.InputHandler(); we forward to list via getFocus().
+	app.tviewApp.SetFocus(app.rootOverlay)
+	if app.currentMessagesView() != nil && len(app.fileRegions) > 0 {
+		app.focusedRegionIndex = 0
+		app.selectedLineIndex = app.fileRegions[0].List.GetCurrentItem()
+		app.updateProgressBar()
+		app.updateHelpPane()
 	}
 	app.currentFocus = focusMessages
 }
 
-// showHelp displays the help modal with keybindings and flags
+// showTextPopup shows a generic overlay popup (same style as Search/Add Rule): title, text body,
+// dark background for frame and content. Only Esc closes. height in rows (0 = default 18).
+func (app *App) showTextPopup(title, body string, height int, onClose func()) {
+	darkGray := tcell.NewRGBColor(30, 30, 30)
+	tv := tview.NewTextView()
+	tv.SetText("[white]" + body + "[-]")
+	tv.SetDynamicColors(true)
+	tv.SetWordWrap(true)
+	tv.SetBackgroundColor(darkGray)
+	popup := tview.NewGrid().SetRows(-1).SetColumns(-1).AddItem(tv, 0, 0, 1, 1, 0, 0, false)
+	popup.SetBorder(true).SetTitle(" " + title + " ").SetBackgroundColor(darkGray)
+	if height <= 0 {
+		height = 18
+	}
+	app.rootOverlay.SetTextPopup(popup, height)
+	app.textPopupOnClose = onClose
+	app.rootOverlay.SetEscapeHandler(func() {
+		if app.textPopupOnClose != nil {
+			app.textPopupOnClose()
+			app.textPopupOnClose = nil
+		}
+	})
+	app.tviewApp.SetFocus(app.rootOverlay)
+}
+
+// showHelp displays the help popup (same overlay style as Search/Add Rule).
 func (app *App) showHelp() {
 	helpContent := `
 Keybindings:
@@ -1533,13 +1755,17 @@ Keybindings:
 - f: Toggle follow mode
 - /: Search
 - n: Next search result
+- r: Add matching rule
 - q: Quit
 - h, ?: Show this help
 `
-	app.showMessage(helpContent, app.flex)
+	app.showTextPopup("Help", helpContent, 18, func() {
+		app.clearPopup()
+		app.textPopupOnClose = nil
+	})
 }
 
-// showMessage displays a modal with the given message
+// showMessage displays a modal with the given message (used for errors etc.)
 func (app *App) showMessage(message string, returnTo tview.Primitive) {
 	modal := tview.NewModal().
 		SetText(message).
