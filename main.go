@@ -109,6 +109,8 @@ func main() {
 				pid,
 				sleepInterval,
 				zeroTerminated,
+				cfg.Rollover,
+				cfg.SearchCase,
 			)
 
 			if err := appInstance.Run(); err != nil {

@@ -60,7 +60,30 @@ var keyBindings = map[string]rune{
 	"next":      'n',
 	"sensitive": 'c',
 	"partial":   'p',
-	"addRule":   'r',
+	"addRule":    'r',
+	"rollover":   'o',
+	"searchCase": 'c',
+}
+
+// Valid rollover modes
+const (
+	RolloverNone  = "none"
+	RolloverStart = "start"
+	RolloverEnd   = "end"
+	RolloverBoth  = "both"
+)
+
+// rolloverModesCycle order for shortcut: each press goes to next
+var rolloverModesCycle = []string{RolloverNone, RolloverStart, RolloverEnd, RolloverBoth}
+
+// normalizeRollover returns a valid rollover mode; invalid or empty becomes RolloverBoth.
+func normalizeRollover(s string) string {
+	switch s {
+	case RolloverNone, RolloverStart, RolloverEnd, RolloverBoth:
+		return s
+	default:
+		return RolloverBoth
+	}
 }
 
 // FocusState represents the current focus in the UI
@@ -209,7 +232,8 @@ type App struct {
 	saveFilenameInput  *tview.InputField
 	searchInput        *tview.InputField
 	progressBar        *tview.TextView
-	helpText           *tview.TextView
+	helpText           *tview.TextView   // left part of help line
+	helpRightText      *tview.TextView  // right-aligned "roll: start|end|both|none"
 	flex               *tview.Flex
 	rootOverlay        *overlayRoot // root: flex full-screen + optional centered popup (TUI visible, half-width popup)
 	textPopupOnClose   func()       // when non-nil, Esc closes the generic text popup
@@ -244,9 +268,11 @@ type App struct {
 	Pid                int     // if > 0 and following, exit when this process dies (GNU tail --pid)
 	SleepInterval      float64 // if > 0 and following, poll file every N seconds (GNU tail -s)
 	ZeroTerminated     bool    // input is NUL-delimited (GNU tail -z)
-	searchTerm         string
-	searchResults      []int
-	currentSearchIndex int
+	searchTerm          string
+	searchResults       []int
+	currentSearchIndex  int
+	rolloverMode        string // "start" | "end" | "both" | "none"
+	searchCaseSensitive bool   // if false (default), search is case-insensitive
 }
 
 // parseBytesSpec parses a bytes spec like "100" (last N) or "+100" (from byte N).
@@ -271,7 +297,7 @@ func parseBytesSpec(s string) (bytesLast, bytesFrom int64) {
 }
 
 // NewApp creates a new application instance. inputFiles must have at least one path.
-func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool) *App {
+func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool, rollover string, searchCase bool) *App {
 	bytesLast, bytesFrom := parseBytesSpec(bytesStr)
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
@@ -295,7 +321,9 @@ func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFi
 		LinesFrom:         linesFrom,
 		Pid:               pid,
 		SleepInterval:     sleepInterval,
-		ZeroTerminated:    zeroTerminated,
+		ZeroTerminated:     zeroTerminated,
+		rolloverMode:       normalizeRollover(rollover),
+		searchCaseSensitive: searchCase,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -1069,6 +1097,19 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 		case keyBindings["help"], '?':
 			app.showHelp()
 			return nil
+		case keyBindings["rollover"]:
+			// Only when not in search or add-rule popup
+			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
+				app.cycleRolloverMode()
+				return nil
+			}
+		case keyBindings["searchCase"]:
+			// c toggles search case when in messages view (not in search/add-rule); in rules view 'c' stays for rule sensitive
+			if app.currentFocus == focusMessages && app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
+				app.searchCaseSensitive = !app.searchCaseSensitive
+				app.updateHelpPane()
+				return nil
+			}
 		case keyBindings["quit"]:
 			if app.textPopupOnClose != nil {
 				return nil
@@ -1085,6 +1126,46 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	switch currentFocus {
 	case focusMessages:
 		switch event.Key() {
+		case tcell.KeyUp:
+			lv := app.currentMessagesView()
+			if lv != nil {
+				n := lv.GetItemCount()
+				if n == 0 {
+					return nil
+				}
+				cur := lv.GetCurrentItem()
+				if cur == 0 {
+					// At first line: roll to end if start or both; else consume key so list doesn't wrap
+					if app.rolloverMode == RolloverStart || app.rolloverMode == RolloverBoth {
+						lv.SetCurrentItem(n - 1)
+						app.selectedLineIndex = n - 1
+						app.updateProgressBar()
+						app.updateHelpPane()
+					}
+					return nil
+				}
+			}
+			return event
+		case tcell.KeyDown:
+			lv := app.currentMessagesView()
+			if lv != nil {
+				n := lv.GetItemCount()
+				if n == 0 {
+					return nil
+				}
+				cur := lv.GetCurrentItem()
+				if cur == n-1 {
+					// At last line: roll to start if end or both; else consume key so list doesn't wrap
+					if app.rolloverMode == RolloverEnd || app.rolloverMode == RolloverBoth {
+						lv.SetCurrentItem(0)
+						app.selectedLineIndex = 0
+						app.updateProgressBar()
+						app.updateHelpPane()
+					}
+					return nil
+				}
+			}
+			return event
 		case tcell.KeyEnter:
 			app.viewSelectedLine()
 			return nil
@@ -1100,6 +1181,9 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 				app.nextSearchResult()
 			case keyBindings["addRule"]:
 				app.initiateAddRule()
+			case keyBindings["searchCase"]:
+				app.searchCaseSensitive = !app.searchCaseSensitive
+				app.updateHelpPane()
 			}
 			return nil
 		}
@@ -1146,6 +1230,19 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	}
 
 	return event
+}
+
+// cycleRolloverMode advances rollover to the next mode: none -> start -> end -> both -> none.
+func (app *App) cycleRolloverMode() {
+	for i, m := range rolloverModesCycle {
+		if m == app.rolloverMode {
+			app.rolloverMode = rolloverModesCycle[(i+1)%len(rolloverModesCycle)]
+			app.updateHelpPane()
+			return
+		}
+	}
+	app.rolloverMode = RolloverBoth
+	app.updateHelpPane()
 }
 
 // closeSearchInput closes the search popup.
@@ -1198,8 +1295,11 @@ func (app *App) performSearch() {
 	app.searchResults = []int{}
 	app.currentSearchIndex = 0
 
-	// Compile the regex
-	regex, err := regexp.Compile(app.searchTerm)
+	pattern := app.searchTerm
+	if !app.searchCaseSensitive {
+		pattern = "(?i)" + pattern
+	}
+	regex, err := regexp.Compile(pattern)
 	if err != nil {
 		logging.LogAppAction(fmt.Sprintf("Invalid regex: %v", err))
 		app.showMessage(fmt.Sprintf("Invalid regex: %v", err), app.rootOverlay)
@@ -1651,12 +1751,21 @@ func (app *App) initUI() {
 	app.progressBar.SetBorder(false)
 	app.progressBar.SetTitle("") // No title for progress bar
 
-	// Initialize helpText (Existing Bottom Help Pane)
+	// Initialize help line: left (help + line status) + right-aligned "roll: mode"
 	app.helpText = tview.NewTextView()
 	app.helpText.SetDynamicColors(true)
 	app.helpText.SetBorder(false)
 	app.helpText.SetTextColor(tcell.ColorYellow)
-	app.helpText.SetText("Press 'h' for help | Line: 0 / 0") // Initial status
+	app.helpText.SetText("Press 'h' for help | Line: 0 / 0")
+	app.helpRightText = tview.NewTextView()
+	app.helpRightText.SetDynamicColors(true)
+	app.helpRightText.SetBorder(false)
+	app.helpRightText.SetTextColor(tcell.ColorYellow)
+	app.helpRightText.SetTextAlign(tview.AlignRight)
+	app.helpRightText.SetText(app.helpRightLabel())
+	helpPane := tview.NewFlex().SetDirection(tview.FlexColumn).
+		AddItem(app.helpText, 0, 1, false).
+		AddItem(app.helpRightText, 20, 0, false) // "Case  roll: both"
 
 	// Create a top FlexRow containing messages area and rulesView side by side
 	topFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
@@ -1670,7 +1779,7 @@ func (app *App) initUI() {
 		AddItem(rulesContainer, 0, 2, false).
 		AddItem(app.saveFilenameInput, 0, 0, false). // Initially hidden
 		AddItem(app.progressBar, 1, 0, false).
-		AddItem(app.helpText, 1, 0, false)          // Existing help pane
+		AddItem(helpPane, 1, 0, false)
 
 	// Root is overlay: flex full-screen, popup (when shown) centered at half screen width; TUI stays visible.
 	app.rootOverlay = newOverlayRoot(app.flex)
@@ -1733,6 +1842,8 @@ Keybindings:
 - /: Search
 - n: Next search result
 - r: Add matching rule
+- o: Cycle rollover (start/end/both/none)
+- c: Toggle search case (case/Case)
 - q: Quit
 - h, ?: Show this help
 `
@@ -2234,7 +2345,7 @@ func (app *App) updateHelpPane() {
 		currentLine = totalLines
 	}
 
-	// Update help text
+	// Update help text (left part)
 	helpMessage := "Press 'h' for help"
 	lineStatus := fmt.Sprintf(" | Line: %d / %d", currentLine, totalLines)
 
@@ -2247,6 +2358,16 @@ func (app *App) updateHelpPane() {
 	}
 
 	app.helpText.SetText(helpMessage)
+	app.helpRightText.SetText(app.helpRightLabel())
+}
+
+// helpRightLabel returns the right part of the help line: "case"/"Case" and "roll: mode".
+func (app *App) helpRightLabel() string {
+	caseStr := "case"
+	if app.searchCaseSensitive {
+		caseStr = "Case"
+	}
+	return caseStr + "  roll: " + app.rolloverMode
 }
 
 // getFullContent reads the entire file content for saving in full mode

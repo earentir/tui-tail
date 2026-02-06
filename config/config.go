@@ -40,6 +40,13 @@ type Config struct {
 	// FollowName, when true, makes ttail follow by name (reopen on rotate, like tail -F).
 	// Used as default for -F / --follow-name. Implies follow when set.
 	FollowName bool `json:"follow_name"`
+
+	// Rollover controls wrap when scrolling past first/last line: "start" (up at first -> end),
+	// "end" (down at last -> start), "both", or "none". Default "both".
+	Rollover string `json:"rollover"`
+
+	// SearchCase, when true, makes search case-sensitive. When false (default), search is case-insensitive.
+	SearchCase bool `json:"searchcase"`
 }
 
 // Default returns a config with all default values.
@@ -52,6 +59,8 @@ func Default() Config {
 		LogFile:    "",
 		Follow:     false,
 		FollowName: false,
+		Rollover:   "both",
+		SearchCase: false,
 	}
 }
 
