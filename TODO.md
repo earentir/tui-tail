@@ -22,8 +22,8 @@ Features and behaviour to align with or add compared to GNU tail.
 
 ## Follow-related options
 
-- [ ] **--pid=PID** – With follow, exit when the process with the given PID dies (for scripting).
-- [ ] **--sleep-interval** – With follow, poll every N seconds when filesystem notifications aren’t available (e.g. network filesystems).
+- [x] **--pid=PID** – With follow, exit when the process with the given PID dies (for scripting).
+- [x] **--sleep-interval** – With follow, poll every N seconds when filesystem notifications aren’t available (e.g. network filesystems).
 
 ## Input format
 

@@ -49,17 +49,19 @@ func main() {
 	}
 
 	var (
-		numLinesStr  string
-		maxLines     int
-		rulesFile    string
-		configFile   string
-		fullMode     bool
-		headMode     bool
-		logFile      string
-		follow       bool
-		followName   bool
-		retry        bool
-		bytes        string
+		numLinesStr    string
+		maxLines       int
+		rulesFile      string
+		configFile     string
+		fullMode       bool
+		headMode       bool
+		logFile        string
+		follow         bool
+		followName     bool
+		retry          bool
+		bytes          string
+		pid            int
+		sleepInterval  float64
 	)
 
 	rootCmd := &cobra.Command{
@@ -103,6 +105,8 @@ func main() {
 				retry,
 				bytes,
 				linesFrom,
+				pid,
+				sleepInterval,
 			)
 
 			if err := appInstance.Run(); err != nil {
@@ -127,6 +131,8 @@ func main() {
 	rootCmd.Flags().BoolVarP(&follow, "follow", "f", cfg.Follow, "Follow (tail) the file and show new lines as they are written")
 	rootCmd.Flags().BoolVarP(&followName, "follow-name", "F", cfg.FollowName, "Follow by name: reopen when the file is replaced (e.g. log rotate), like GNU tail -F")
 	rootCmd.Flags().BoolVar(&retry, "retry", false, "Keep trying to open the file when it is unavailable (e.g. not yet created)")
+	rootCmd.Flags().IntVar(&pid, "pid", 0, "With --follow, exit when the process with the given PID dies (GNU tail --pid)")
+	rootCmd.Flags().Float64Var(&sleepInterval, "sleep-interval", 0, "With --follow, poll file every N seconds (e.g. for network filesystems); 0 = default (GNU tail -s)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

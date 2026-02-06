@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"ttail/logging"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/hpcloud/tail"
+	"github.com/hpcloud/tail/watch"
 	"github.com/rivo/tview"
 	"golang.org/x/term"
 )
@@ -104,7 +106,9 @@ type App struct {
 	HeadMode           bool
 	BytesLast          int64 // last N bytes (0 = not used)
 	BytesFrom          int64 // from byte N to end (0 = not used)
-	LinesFrom          int   // from line N to end, skip first N-1 (0 = not used)
+	LinesFrom          int     // from line N to end, skip first N-1 (0 = not used)
+	Pid                int     // if > 0 and following, exit when this process dies (GNU tail --pid)
+	SleepInterval      float64 // if > 0 and following, poll file every N seconds (GNU tail -s)
 	searchTerm         string
 	searchResults      []int
 	currentSearchIndex int
@@ -132,7 +136,7 @@ func parseBytesSpec(s string) (bytesLast, bytesFrom int64) {
 }
 
 // NewApp creates a new application instance
-func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int) *App {
+func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64) *App {
 	bytesLast, bytesFrom := parseBytesSpec(bytesStr)
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
@@ -153,6 +157,8 @@ func NewApp(inputMessagesFile string, initialLines, maxLines int, rulesFile, con
 		BytesLast:         bytesLast,
 		BytesFrom:         bytesFrom,
 		LinesFrom:         linesFrom,
+		Pid:               pid,
+		SleepInterval:     sleepInterval,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -192,8 +198,35 @@ func (app *App) Run() error {
 	if app.followMode {
 		app.tailStarted = true
 		go app.tailInputMessagesFile(ctx)
+		if app.Pid > 0 {
+			go app.monitorPid(ctx)
+		}
 	}
 	return app.tviewApp.Run()
+}
+
+// processExists reports whether the process with the given PID exists (Unix: kill(pid, 0)).
+// On Windows this may not be reliable; --pid is primarily for Unix.
+func processExists(pid int) bool {
+	return syscall.Kill(pid, syscall.Signal(0)) == nil
+}
+
+// monitorPid exits the app when the process with app.Pid dies (GNU tail --pid).
+func (app *App) monitorPid(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !processExists(app.Pid) {
+				logging.LogAppAction(fmt.Sprintf("Process %d exited, stopping", app.Pid))
+				app.tviewApp.QueueUpdate(func() { app.tviewApp.Stop() })
+				return
+			}
+		}
+	}
 }
 
 // waitForFileToExist blocks until the input file exists or ctx is cancelled.
@@ -1266,6 +1299,9 @@ func (app *App) showMessage(message string, returnTo tview.Primitive) {
 // ReOpen is true only when -F (follow-name) is set; otherwise follow by descriptor (GNU tail -f).
 func (app *App) tailInputMessagesFile(ctx context.Context) {
 	logging.LogAppAction("Starting to tail input messages file")
+	if app.SleepInterval > 0 {
+		watch.POLL_DURATION = time.Duration(app.SleepInterval * float64(time.Second))
+	}
 	t, err := tail.TailFile(app.inputMessagesFile, tail.Config{
 		Follow:    true,
 		ReOpen:    app.FollowName, // true only with -F (follow by name, reopen on rotate)

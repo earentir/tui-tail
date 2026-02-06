@@ -112,9 +112,11 @@ Flags that match GNU tail have a short form in parentheses.
 | `--log-file`    |       | Path or directory for application logs |
 | `--follow`      | `-f`  | Follow (tail) the file and show new lines as they are written (default: off) |
 | `--follow-name` | `-F`  | Follow by name: reopen when the file is replaced (e.g. log rotate); implies `-f` |
-| `--retry`       |       | Keep trying to open the file when it is unavailable (e.g. not yet created) |
-| `--help`        |       | Show help |
-| `--version`     |       | Show version |
+| `--retry`           |       | Keep trying to open the file when it is unavailable (e.g. not yet created) |
+| `--pid`             |       | With `-f`, exit when the process with the given PID dies (GNU tail --pid; Unix) |
+| `--sleep-interval`  |       | With `-f`, poll file every N seconds (e.g. network FS); 0 = default (GNU tail -s) |
+| `--help`            |       | Show help |
+| `--version`         |       | Show version |
 
 ### Examples
 
@@ -124,6 +126,8 @@ ttail /var/log/app.log -n 100 --colour-file colour_rule_example.json
 ttail /var/log/app.log -n +100                  # from line 100 to end (like GNU tail -n +100)
 ttail /var/log/app.log -c 1024                  # last 1024 bytes
 ttail /var/log/app.log -c +100                  # from byte 100 to end
+ttail /var/log/app.log -f --pid 1234           # follow and exit when process 1234 dies
+ttail /var/log/app.log -f --sleep-interval 2   # follow, poll every 2 seconds
 ttail /var/log/app.log --rules-file rules.json --full
 ```
 
