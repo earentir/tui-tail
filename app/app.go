@@ -885,7 +885,12 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	// Handle global shortcuts
 	switch event.Key() {
 	case tcell.KeyTab:
-		app.cycleFocus()
+		forward := (event.Modifiers() & tcell.ModShift) == 0
+		app.cycleFocus(forward)
+		return nil
+	case tcell.KeyBacktab:
+		// Shift+Tab is often sent as KeyBacktab; cycle to previous pane (don't let list treat it as "move up")
+		app.cycleFocus(false)
 		return nil
 	case tcell.KeyEscape:
 		if app.tviewApp.GetFocus() == app.viewModal {
@@ -1122,15 +1127,15 @@ func (app *App) togglePartialMatch() {
 	app.updateRulesView()
 }
 
-// cycleFocus cycles the UI focus between panes. With multiple files, Tab cycles through
-// each file's list first, then rule input, rules view, search.
-func (app *App) cycleFocus() {
+// cycleFocus cycles the UI focus between panes. Tab = forward, Shift+Tab = backward.
+// Order: file lists (0..N-1), rule input, rules view — then wrap to first file (search is not in Tab cycle).
+func (app *App) cycleFocus(forward bool) {
 	nRegions := len(app.fileRegions)
 	messageSlots := 1
 	if nRegions > 0 {
 		messageSlots = nRegions
 	}
-	totalSlots := messageSlots + 3 // messages (1 or N), ruleInput, rulesView, searchInput
+	totalSlots := messageSlots + 2 // files, rule input, rules view (no search — it's often hidden)
 
 	slot := 0
 	switch app.currentFocus {
@@ -1142,34 +1147,39 @@ func (app *App) cycleFocus() {
 		}
 	case focusRuleInput:
 		slot = messageSlots
-	case focusRulesView:
+	case focusRulesView, focusSearchInput:
+		// Search is not in cycle; from rules or search, "next" wraps to first file
 		slot = messageSlots + 1
-	case focusSearchInput:
-		slot = messageSlots + 2
 	default:
 		slot = 0
 	}
 
-	nextSlot := (slot + 1) % totalSlots
-
-	if nextSlot < messageSlots {
-		app.currentFocus = focusMessages
-		app.focusedRegionIndex = nextSlot
-		app.tviewApp.SetFocus(app.fileRegions[nextSlot].List)
+	var targetSlot int
+	if forward {
+		targetSlot = (slot + 1) % totalSlots
 	} else {
-		switch nextSlot - messageSlots {
+		targetSlot = (slot - 1 + totalSlots) % totalSlots
+	}
+
+	if targetSlot < messageSlots {
+		app.currentFocus = focusMessages
+		app.focusedRegionIndex = targetSlot
+		list := app.fileRegions[targetSlot].List
+		app.tviewApp.SetFocus(list)
+		app.selectedLineIndex = list.GetCurrentItem()
+		app.updateProgressBar()
+		app.updateHelpPane()
+	} else {
+		switch targetSlot - messageSlots {
 		case 0:
 			app.currentFocus = focusRuleInput
 			app.tviewApp.SetFocus(app.ruleInput)
 		case 1:
 			app.currentFocus = focusRulesView
 			app.tviewApp.SetFocus(app.rulesView)
-		case 2:
-			app.currentFocus = focusSearchInput
-			app.tviewApp.SetFocus(app.searchInput)
 		}
 	}
-	logging.LogAppAction(fmt.Sprintf("Focus cycled to slot %d", nextSlot))
+	logging.LogAppAction(fmt.Sprintf("Focus cycled to slot %d", targetSlot))
 }
 
 // viewSelectedLine displays the selected line in a modal
@@ -1377,7 +1387,8 @@ func (app *App) initUI() {
 			if width <= 0 || height <= 0 {
 				return x, y, width, height
 			}
-			selected := len(app.fileRegions) > 0 && app.focusedRegionIndex == idx
+			// Only highlight when focus is actually on a file list (messages pane), not when on rule input etc.
+			selected := app.currentFocus == focusMessages && len(app.fileRegions) > 0 && app.focusedRegionIndex == idx
 			drawHeaderLine(screen, x, y, width, path, selected, selected)
 			return x, y + 1, width, 0
 		})
@@ -1393,6 +1404,13 @@ func (app *App) initUI() {
 			AddItem(list, 0, 1, false)
 		app.multiFileView.AddItem(regionFlex, 0, 1, false)
 
+		list.SetFocusFunc(func() {
+			app.focusedRegionIndex = idx
+			app.currentFocus = focusMessages
+			app.selectedLineIndex = list.GetCurrentItem()
+			app.updateProgressBar()
+			app.updateHelpPane()
+		})
 		list.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
 			app.focusedRegionIndex = idx
 			app.currentFocus = focusMessages
@@ -1417,7 +1435,8 @@ func (app *App) initUI() {
 	rulesHeader.SetBorder(false)
 	rulesHeader.SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
 		if width > 0 && height > 0 {
-			drawHeaderLine(screen, x, y, width, "Matching Rules", false, false)
+			selected := app.currentFocus == focusRulesView
+			drawHeaderLine(screen, x, y, width, "Matching Rules", selected, selected)
 		}
 		return x, y + 1, width, 0
 	})
@@ -1425,10 +1444,17 @@ func (app *App) initUI() {
 		AddItem(rulesHeader, 1, 0, false).
 		AddItem(app.rulesView, 0, 1, false)
 
+	app.rulesView.SetFocusFunc(func() {
+		app.currentFocus = focusRulesView
+	})
+
 	// Initialize ruleInput
 	app.ruleInput = tview.NewInputField()
 	app.ruleInput.SetLabel("Add Matching Rule: ")
 	app.ruleInput.SetFieldWidth(30)
+	app.ruleInput.SetFocusFunc(func() {
+		app.currentFocus = focusRuleInput
+	})
 
 	// Initialize viewModal
 	app.viewModal = tview.NewTextView()
@@ -1448,6 +1474,9 @@ func (app *App) initUI() {
 	app.searchInput = tview.NewInputField()
 	app.searchInput.SetLabel("Search: ")
 	app.searchInput.SetFieldWidth(30)
+	app.searchInput.SetFocusFunc(func() {
+		app.currentFocus = focusSearchInput
+	})
 
 	// Initialize progressBar
 	app.progressBar = tview.NewTextView()
@@ -1481,6 +1510,13 @@ func (app *App) initUI() {
 	app.tviewApp.SetRoot(app.flex, true)
 	if app.currentMessagesView() != nil {
 		app.tviewApp.SetFocus(app.currentMessagesView())
+		// Sync focused region and progress in case SetRoot gave focus to another list first (e.g. last)
+		if len(app.fileRegions) > 0 {
+			app.focusedRegionIndex = 0
+			app.selectedLineIndex = app.fileRegions[0].List.GetCurrentItem()
+			app.updateProgressBar()
+			app.updateHelpPane()
+		}
 	}
 	app.currentFocus = focusMessages
 }
