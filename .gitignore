@@ -28,3 +28,10 @@ ttail
 somefilewetail
 bin/*
 builds/
+
+# Local Go / linter caches (never commit)
+.cache/
+.gocache/
+.gomodcache/
+.gopath/
+.bin/

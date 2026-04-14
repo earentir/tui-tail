@@ -20,7 +20,7 @@ func InitAppLogging(logFilePath string) error {
 	// Determine absolute path
 	absPath, err := filepath.Abs(logFilePath)
 	if err != nil {
-		return fmt.Errorf("Error getting absolute path of '%s': %v", logFilePath, err)
+		return fmt.Errorf("error getting absolute path of '%s': %v", logFilePath, err)
 	}
 
 	isDir := false
@@ -40,19 +40,19 @@ func InitAppLogging(logFilePath string) error {
 			// Create the directory
 			err = os.MkdirAll(absPath, 0755)
 			if err != nil {
-				return fmt.Errorf("Error creating log directory '%s': %v", absPath, err)
+				return fmt.Errorf("error creating log directory '%s': %v", absPath, err)
 			}
 		} else {
 			// Assume it's a file path, ensure parent directory exists
 			dir := filepath.Dir(absPath)
 			err = os.MkdirAll(dir, 0755)
 			if err != nil {
-				return fmt.Errorf("Error creating log directory '%s': %v", dir, err)
+				return fmt.Errorf("error creating log directory '%s': %v", dir, err)
 			}
 		}
 	} else {
 		// Some other error accessing the path
-		return fmt.Errorf("Error accessing log file path '%s': %v", absPath, err)
+		return fmt.Errorf("error accessing log file path '%s': %v", absPath, err)
 	}
 
 	if isDir {
@@ -63,7 +63,7 @@ func InitAppLogging(logFilePath string) error {
 	// Try to open or create the log file
 	logFile, err := os.OpenFile(absPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("Error opening log file '%s': %v", absPath, err)
+		return fmt.Errorf("error opening log file '%s': %v", absPath, err)
 	}
 
 	log.SetOutput(logFile)

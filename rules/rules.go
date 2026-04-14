@@ -27,7 +27,7 @@ type ColorRule struct {
 // ParseRule parses a rule input string into a Rule struct
 func ParseRule(input string) (Rule, error) {
 	if strings.TrimSpace(input) == "" {
-		return Rule{}, fmt.Errorf("Rule cannot be empty")
+		return Rule{}, fmt.Errorf("rule cannot be empty")
 	}
 
 	caseSensitive := false
@@ -39,7 +39,7 @@ func ParseRule(input string) (Rule, error) {
 		pattern := strings.TrimPrefix(input, "regex:")
 		regex, err := regexp.Compile(pattern)
 		if err != nil {
-			return Rule{}, fmt.Errorf("Invalid regex pattern: %v", err)
+			return Rule{}, fmt.Errorf("invalid regex pattern: %v", err)
 		}
 		compiledRegex = regex
 		regexString = pattern
