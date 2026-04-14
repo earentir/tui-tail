@@ -59,7 +59,8 @@ var keyBindings = map[string]rune{
 	"next":      'n',
 	"sensitive": 'c',
 	"partial":   'p',
-	"addRule":    'r',
+	"addRule":    'a',
+	"reload":     'r',
 	"rollover":   'o',
 	"searchCase": 'c',
 }
@@ -273,6 +274,8 @@ type App struct {
 	Version             string
 	escapeQuitArmed     bool
 	escapeQuitTimer     *time.Timer
+	reloadStatus        string // transient left status (reload phases); empty = default help line
+	reloadStatusTimer   *time.Timer
 }
 
 // parseBytesSpec parses a bytes spec like "100" (last N) or "+100" (from byte N).
@@ -737,6 +740,7 @@ func (app *App) displayInitialInputMessages() {
 
 // displayInitialFile loads initial lines for one file into the given region (multi-file mode).
 func (app *App) displayInitialFile(region *FileRegion) {
+	region.List.Clear()
 	path := region.Path
 	var lines []string
 	var err error
@@ -790,6 +794,106 @@ func (app *App) displayInitialFile(region *FileRegion) {
 	if app.followMode {
 		region.List.SetCurrentItem(region.List.GetItemCount() - 1)
 	}
+}
+
+// setReloadStatus shows a transient message on the help line; clears after a few seconds.
+func (app *App) setReloadStatus(msg string) {
+	app.reloadStatus = msg
+	if app.reloadStatusTimer != nil {
+		app.reloadStatusTimer.Stop()
+		app.reloadStatusTimer = nil
+	}
+	app.reloadStatusTimer = time.AfterFunc(5*time.Second, func() {
+		app.tviewApp.QueueUpdateDraw(func() {
+			app.reloadStatus = ""
+			if app.reloadStatusTimer != nil {
+				app.reloadStatusTimer = nil
+			}
+			app.updateHelpPane()
+		})
+	})
+	app.updateHelpPane()
+}
+
+// startOutputReload re-reads the on-disk window (same as startup) without following; preserves list row per region.
+func (app *App) startOutputReload() {
+	if app.followMode {
+		app.setReloadStatus("Reload unavailable while following (-f)")
+		return
+	}
+	if app.FullMode {
+		app.setReloadStatus("Reload unavailable in --full mode")
+		return
+	}
+	if len(app.fileRegions) == 0 {
+		app.setReloadStatus("Reload: no file view")
+		return
+	}
+
+	savedIdx := make([]int, len(app.fileRegions))
+	for i, r := range app.fileRegions {
+		if r.List != nil && r.List.GetItemCount() > 0 {
+			savedIdx[i] = r.List.GetCurrentItem()
+		}
+	}
+	savedFocus := app.focusedRegionIndex
+
+	app.reloadStatus = "Reloading…"
+	if app.reloadStatusTimer != nil {
+		app.reloadStatusTimer.Stop()
+		app.reloadStatusTimer = nil
+	}
+	app.updateHelpPane()
+
+	go func() {
+		time.Sleep(70 * time.Millisecond)
+		app.tviewApp.QueueUpdateDraw(func() {
+			app.reloadStatus = "Seeking…"
+			app.updateHelpPane()
+		})
+		time.Sleep(70 * time.Millisecond)
+		app.tviewApp.QueueUpdateDraw(func() {
+			app.searchResults = nil
+			app.currentSearchIndex = 0
+			for _, region := range app.fileRegions {
+				app.displayInitialFile(region)
+			}
+			for i, region := range app.fileRegions {
+				n := region.List.GetItemCount()
+				if n == 0 {
+					continue
+				}
+				cur := savedIdx[i]
+				if cur >= n {
+					cur = n - 1
+				}
+				if cur < 0 {
+					cur = 0
+				}
+				region.List.SetCurrentItem(cur)
+			}
+			if savedFocus >= 0 && savedFocus < len(app.fileRegions) {
+				app.focusedRegionIndex = savedFocus
+				if lv := app.fileRegions[savedFocus].List; lv != nil && lv.GetItemCount() > 0 {
+					app.selectedLineIndex = lv.GetCurrentItem()
+				}
+			}
+			at := time.Now().Format("15:04:05")
+			app.reloadStatus = fmt.Sprintf("Re-loaded at: %s", at)
+			if app.reloadStatusTimer != nil {
+				app.reloadStatusTimer.Stop()
+			}
+			app.reloadStatusTimer = time.AfterFunc(5*time.Second, func() {
+				app.tviewApp.QueueUpdateDraw(func() {
+					app.reloadStatus = ""
+					app.reloadStatusTimer = nil
+					app.updateHelpPane()
+				})
+			})
+			app.updateProgressBar()
+			app.updateHelpPane()
+		})
+	}()
 }
 
 // readLastNLines reads the last N lines (or NUL-delimited records) from a file.
@@ -1088,6 +1192,11 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 		case keyBindings["help"], '?':
 			app.showHelp()
 			return nil
+		case keyBindings["reload"]:
+			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
+				app.startOutputReload()
+				return nil
+			}
 		case keyBindings["rollover"]:
 			// Only when not in search or add-rule popup
 			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
@@ -1840,6 +1949,7 @@ func (app *App) showHelp() {
 [yellow]Messages / File View[-]
 - Up/Down: Navigate lines
 - Enter, v: View selected line
+- r: Reload from disk (same scope as startup; not with -f or --full)
 - /: Open search input
 - n: Next search result
 - f: Toggle follow mode`)
@@ -1854,7 +1964,7 @@ func (app *App) showHelp() {
   - Search input: case/Case
   - Rules view: rule sensitivity
 - p: Toggle rule partial
-- r: Add matching rule
+- a: Add matching rule
 - o: Cycle rollover
 - s: Save selected scope/file
 
@@ -1882,7 +1992,7 @@ func (app *App) showHelp() {
 	frame := tview.NewGrid().SetRows(-1).SetColumns(-1).AddItem(popup, 0, 0, 1, 1, 0, 0, false)
 	frame.SetBorder(true).SetTitle(" Help ").SetBackgroundColor(darkGray)
 
-	app.rootOverlay.SetTextPopup(frame, 19)
+	app.rootOverlay.SetTextPopup(frame, 20)
 	app.textPopupOnClose = func() {
 		app.clearPopup()
 		app.textPopupOnClose = nil
@@ -2444,13 +2554,17 @@ func (app *App) updateHelpPane() {
 		currentLine = totalLines
 	}
 
-	// Left: help and optional match count
+	// Left: help, reload status, optional match count / Esc quit hint
 	helpMessage := "Press 'h' for help"
-	if len(app.searchResults) > 0 {
-		helpMessage += fmt.Sprintf(" | Matches: %d", len(app.searchResults))
-	}
-	if app.escapeQuitArmed {
-		helpMessage += " | Press Esc again in 2s to exit"
+	if app.reloadStatus != "" {
+		helpMessage = app.reloadStatus
+	} else {
+		if len(app.searchResults) > 0 {
+			helpMessage += fmt.Sprintf(" | Matches: %d", len(app.searchResults))
+		}
+		if app.escapeQuitArmed {
+			helpMessage += " | Press Esc again in 2s to exit"
+		}
 	}
 	app.helpText.SetText(helpMessage)
 	app.helpRightText.SetText(app.helpRightLabel(currentLine, totalLines))

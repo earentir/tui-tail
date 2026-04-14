@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var appVersion = "0.3.61"
+var appVersion = "0.3.63"
 
 // parseNumLines parses -n like GNU tail: "N" = last N lines, "+N" = from line N to end.
 // Returns (initialLines, linesFrom). Exactly one of linesFrom > 0 or initialLines used.
@@ -60,9 +60,9 @@ func main() {
 		followName     bool
 		retry          bool
 		bytes          string
-		pid             int
-		sleepInterval   float64
-		zeroTerminated  bool
+		pid            int
+		sleepInterval  float64
+		zeroTerminated bool
 	)
 
 	rootCmd := &cobra.Command{
