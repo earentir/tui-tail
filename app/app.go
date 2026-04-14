@@ -37,10 +37,10 @@ const (
 	DefaultMaxLines     = 1000
 	MsgAppStarted       = "Application started"
 	MsgAppStopped       = "Application stopped"
-	ErrFileOpen         = "Error opening file: %v"
-	ErrFileRead         = "Error reading file: %v"
-	ErrFileCreate       = "Error creating file: %v"
-	ErrFileWrite        = "Error writing to file: %v"
+	ErrFileOpen         = "error opening file: %v"
+	ErrFileRead         = "error reading file: %v"
+	ErrFileCreate       = "error creating file: %v"
+	ErrFileWrite        = "error writing to file: %v"
 	MsgFileSaved        = "File saved successfully: %s"
 	MsgInvalidInput     = "Invalid input"
 	MsgRuleEmpty        = "Rule cannot be empty"
@@ -238,7 +238,6 @@ type App struct {
 	flex               *tview.Flex
 	rootOverlay        *overlayRoot // root: flex full-screen + optional centered popup (TUI visible, half-width popup)
 	textPopupOnClose   func()       // when non-nil, Esc closes the generic text popup
-	totalLinesInFile   int
 	rules              []rules.Rule
 	colorRules         []rules.ColorRule
 	lines              []string
@@ -254,8 +253,6 @@ type App struct {
 	ConfigFile         string
 	logFile            string
 	FullMode           bool
-	fileOffset         int64
-	fileMutex          sync.Mutex
 	cancelFunc         context.CancelFunc
 	runCtx             context.Context
 	followMode         bool
@@ -378,11 +375,6 @@ func (app *App) currentLinesAndMutex() (*[]string, *sync.Mutex) {
 		return &r.Lines, &r.LinesMutex
 	}
 	return &app.lines, &app.linesMutex
-}
-
-// isMultiFile returns true when tailing multiple files.
-func (app *App) isMultiFile() bool {
-	return len(app.inputFiles) > 1
 }
 
 // Run starts the application
@@ -684,7 +676,7 @@ func (app *App) compileColorRules() {
 func (app *App) loadConfigFromFile(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("Error opening config file: %v", err)
+		return fmt.Errorf("error opening config file: %v", err)
 	}
 	defer file.Close()
 
@@ -694,7 +686,7 @@ func (app *App) loadConfigFromFile(filename string) error {
 	}
 	err = decoder.Decode(&config)
 	if err != nil {
-		return fmt.Errorf("Error decoding config file: %v", err)
+		return fmt.Errorf("error decoding config file: %v", err)
 	}
 
 	app.colorRules = config.ColorRules
@@ -706,7 +698,7 @@ func (app *App) loadConfigFromFile(filename string) error {
 func (app *App) loadRulesFromFile(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("Error opening rules file: %v", err)
+		return fmt.Errorf("error opening rules file: %v", err)
 	}
 	defer file.Close()
 
@@ -714,7 +706,7 @@ func (app *App) loadRulesFromFile(filename string) error {
 	var ruleList []rules.Rule
 	err = decoder.Decode(&ruleList)
 	if err != nil {
-		return fmt.Errorf("Error decoding rules file: %v", err)
+		return fmt.Errorf("error decoding rules file: %v", err)
 	}
 
 	// Compile regex patterns
@@ -830,7 +822,7 @@ func (app *App) readLastNLines(filename string, n int, delim byte) ([]string, er
 				lines = append(lines, line)
 				break
 			}
-			return nil, fmt.Errorf("Error reading file: %v", err)
+			return nil, fmt.Errorf("error reading file: %v", err)
 		}
 		if delim == '\n' {
 			line = strings.TrimRight(line, "\r\n")
@@ -1604,32 +1596,6 @@ func (app *App) cancelSave() {
 	app.currentFocus = focusMessages
 }
 
-// deleteSelected deletes the selected line or rule
-func (app *App) deleteSelected() {
-	lv := app.currentMessagesView()
-	if lv != nil && app.currentFocus == focusMessages && app.selectedLineIndex < lv.GetItemCount() {
-		lv.RemoveItem(app.selectedLineIndex)
-		if app.FullMode {
-			app.showMessage("Deletion not supported in full mode", app.rootOverlay)
-		} else {
-			lines, mutex := app.currentLinesAndMutex()
-			mutex.Lock()
-			defer mutex.Unlock()
-			if app.selectedLineIndex < len(*lines) {
-				*lines = append((*lines)[:app.selectedLineIndex], (*lines)[app.selectedLineIndex+1:]...)
-			}
-		}
-		app.updateProgressBar()
-		app.updateHelpPane()
-	} else if app.currentFocus == focusRulesView && app.selectedRuleIndex < len(app.rules) {
-		app.rules = append(app.rules[:app.selectedRuleIndex], app.rules[app.selectedRuleIndex+1:]...)
-		if app.selectedRuleIndex >= len(app.rules) && len(app.rules) > 0 {
-			app.selectedRuleIndex = len(app.rules) - 1
-		}
-		app.updateRulesView()
-	}
-}
-
 // quit gracefully quits the application
 func (app *App) quit() {
 	app.cancelFunc()
@@ -2249,22 +2215,6 @@ func (app *App) tailInputMessagesFileZeroTerminatedForRegion(ctx context.Context
 	}
 }
 
-// updateMessagesView refreshes the messagesView with the current lines
-func (app *App) updateMessagesView() {
-	lv := app.currentMessagesView()
-	if lv == nil {
-		return
-	}
-	lines, mutex := app.currentLinesAndMutex()
-	mutex.Lock()
-	ln := append([]string{}, *lines...)
-	mutex.Unlock()
-	lv.Clear()
-	for _, line := range ln {
-		lv.AddItem(app.lineDisplayText(line), "", 0, nil)
-	}
-}
-
 const maxRulesLines = 3
 const maxRulesTotal = 6
 
@@ -2530,7 +2480,7 @@ func (app *App) getFullContent() ([]string, error) {
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("Error opening file: %v", err)
+		return nil, fmt.Errorf("error opening file: %v", err)
 	}
 	defer file.Close()
 
@@ -2544,7 +2494,7 @@ func (app *App) getFullContent() ([]string, error) {
 				lines = append(lines, line)
 				break
 			}
-			return nil, fmt.Errorf("Error reading file: %v", err)
+			return nil, fmt.Errorf("error reading file: %v", err)
 		}
 		line = strings.TrimRight(line, "\n")
 		lines = append(lines, line)
