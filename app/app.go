@@ -274,6 +274,9 @@ type App struct {
 	currentSearchIndex  int
 	rolloverMode        string // "start" | "end" | "both" | "none"
 	searchCaseSensitive bool   // if false (default), search is case-insensitive
+	Version             string
+	escapeQuitArmed     bool
+	escapeQuitTimer     *time.Timer
 }
 
 // parseBytesSpec parses a bytes spec like "100" (last N) or "+100" (from byte N).
@@ -298,7 +301,7 @@ func parseBytesSpec(s string) (bytesLast, bytesFrom int64) {
 }
 
 // NewApp creates a new application instance. inputFiles must have at least one path.
-func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool, rollover string, searchCase bool) *App {
+func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFile string, fullMode bool, headMode bool, logFile string, follow bool, followName bool, retry bool, bytesStr string, linesFrom int, pid int, sleepInterval float64, zeroTerminated bool, rollover string, searchCase bool, version string) *App {
 	bytesLast, bytesFrom := parseBytesSpec(bytesStr)
 	appInstance := &App{
 		tviewApp:          tview.NewApplication(),
@@ -325,6 +328,7 @@ func NewApp(inputFiles []string, initialLines, maxLines int, rulesFile, configFi
 		ZeroTerminated:     zeroTerminated,
 		rolloverMode:       normalizeRollover(rollover),
 		searchCaseSensitive: searchCase,
+		Version:             version,
 	}
 	appInstance.initUI()
 	appInstance.loadConfig()
@@ -1091,6 +1095,9 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			}
 			return nil
 		}
+		if app.handleEscapeQuit() {
+			return nil
+		}
 	case tcell.KeyRune:
 		switch event.Rune() {
 		case keyBindings["help"], '?':
@@ -1229,6 +1236,38 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	}
 
 	return event
+}
+
+// handleEscapeQuit implements "press Esc twice within 2s to quit".
+// First Esc arms quit and shows a help-line hint; second Esc within 2s quits.
+func (app *App) handleEscapeQuit() bool {
+	if app.escapeQuitArmed {
+		if app.escapeQuitTimer != nil {
+			app.escapeQuitTimer.Stop()
+			app.escapeQuitTimer = nil
+		}
+		app.escapeQuitArmed = false
+		app.quit()
+		return true
+	}
+
+	app.escapeQuitArmed = true
+	app.updateHelpPane()
+
+	if app.escapeQuitTimer != nil {
+		app.escapeQuitTimer.Stop()
+	}
+	app.escapeQuitTimer = time.AfterFunc(2*time.Second, func() {
+		app.tviewApp.QueueUpdateDraw(func() {
+			if !app.escapeQuitArmed {
+				return
+			}
+			app.escapeQuitArmed = false
+			app.escapeQuitTimer = nil
+			app.updateHelpPane()
+		})
+	})
+	return true
 }
 
 // cycleRolloverMode advances rollover to the next mode: none -> start -> end -> both -> none.
@@ -1830,26 +1869,71 @@ func (app *App) showTextPopup(title, body string, height int, onClose func()) {
 
 // showHelp displays the help popup (same overlay style as Search/Add Rule).
 func (app *App) showHelp() {
-	helpContent := `
-Keybindings:
-- Tab: Cycle focus
-- Up/Down: Navigate
-- Enter/v: View selected line
-- s: Save
-- d: Delete selected
-- f: Toggle follow mode
-- /: Search
-- n: Next search result
-- r: Add matching rule
-- o: Cycle rollover (start/end/both/none)
-- c: Toggle search case (case/Case)
+	darkGray := tcell.NewRGBColor(30, 30, 30)
+	left := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWordWrap(true).
+		SetText(`[yellow]Global[-]
 - q: Quit
 - h, ?: Show this help
-`
-	app.showTextPopup("Help", helpContent, 18, func() {
+- Tab: Cycle focus
+
+[yellow]Messages / File View[-]
+- Up/Down: Navigate lines
+- Enter, v: View selected line
+- /: Open search input
+- n: Next search result
+- f: Toggle follow mode`)
+	left.SetBackgroundColor(darkGray)
+
+	right := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWordWrap(true).
+		SetText(`[yellow]Rules / Search[-]
+- d: Delete selected rule
+- c: Toggle case
+  - Search input: case/Case
+  - Rules view: rule sensitivity
+- p: Toggle rule partial
+- r: Add matching rule
+- o: Cycle rollover
+- s: Save selected scope/file
+
+[yellow]Popups[-]
+- Enter: Confirm action
+- Esc: Close popup`)
+	right.SetBackgroundColor(darkGray)
+
+	versionLine := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter).
+		SetText(fmt.Sprintf("[yellow]Version:[-] %s", app.Version))
+	versionLine.SetBackgroundColor(darkGray)
+
+	columns := tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(left, 0, 1, false).
+		AddItem(right, 0, 1, false)
+
+	popup := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(columns, 0, 1, false).
+		AddItem(versionLine, 1, 0, false)
+
+	frame := tview.NewGrid().SetRows(-1).SetColumns(-1).AddItem(popup, 0, 0, 1, 1, 0, 0, false)
+	frame.SetBorder(true).SetTitle(" Help ").SetBackgroundColor(darkGray)
+
+	app.rootOverlay.SetTextPopup(frame, 19)
+	app.textPopupOnClose = func() {
 		app.clearPopup()
 		app.textPopupOnClose = nil
+	}
+	app.rootOverlay.SetEscapeHandler(func() {
+		if app.textPopupOnClose != nil {
+			app.textPopupOnClose()
+		}
 	})
+	app.tviewApp.SetFocus(app.rootOverlay)
 }
 
 // showMessage displays a modal with the given message (used for errors etc.)
@@ -2421,6 +2505,9 @@ func (app *App) updateHelpPane() {
 	helpMessage := "Press 'h' for help"
 	if len(app.searchResults) > 0 {
 		helpMessage += fmt.Sprintf(" | Matches: %d", len(app.searchResults))
+	}
+	if app.escapeQuitArmed {
+		helpMessage += " | Press Esc again in 2s to exit"
 	}
 	app.helpText.SetText(helpMessage)
 	app.helpRightText.SetText(app.helpRightLabel(currentLine, totalLines))

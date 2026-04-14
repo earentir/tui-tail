@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var appVersion = "0.3.57"
+var appVersion = "0.3.61"
 
 // parseNumLines parses -n like GNU tail: "N" = last N lines, "+N" = from line N to end.
 // Returns (initialLines, linesFrom). Exactly one of linesFrom > 0 or initialLines used.
@@ -111,6 +111,7 @@ func main() {
 				zeroTerminated,
 				cfg.Rollover,
 				cfg.SearchCase,
+				appVersion,
 			)
 
 			if err := appInstance.Run(); err != nil {
