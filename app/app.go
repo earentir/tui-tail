@@ -34,6 +34,7 @@ const (
 const (
 	DefaultInitialLines = 10
 	DefaultMaxLines     = 1000
+	loadOlderStep       = 10 // lines added per plain "l" key
 	MsgAppStarted       = "Application started"
 	MsgAppStopped       = "Application stopped"
 	ErrFileOpen         = "error opening file: %v"
@@ -96,6 +97,7 @@ const (
 	focusSaveInput
 	focusViewModal
 	focusSearchInput
+	focusLoadOlderInput
 )
 
 // overlayRoot draws the main flex full-screen and optionally a popup centered on top (half screen width).
@@ -232,6 +234,7 @@ type App struct {
 	viewModal          *tview.TextView
 	saveFilenameInput  *tview.InputField
 	searchInput        *tview.InputField
+	loadOlderInput     *tview.InputField
 	progressBar        *tview.TextView
 	helpText           *tview.TextView   // left part of help line
 	helpRightText      *tview.TextView  // right-aligned "roll: start|end|both|none"
@@ -796,6 +799,110 @@ func (app *App) displayInitialFile(region *FileRegion) {
 	}
 }
 
+// reloadDataLocationLabel describes which slice of the file was re-read (same scope as startup), not a filesystem path.
+func (app *App) reloadDataLocationLabel() string {
+	switch {
+	case app.BytesLast > 0:
+		return fmt.Sprintf("last %d bytes", app.BytesLast)
+	case app.BytesFrom > 0:
+		return fmt.Sprintf("from byte +%d", app.BytesFrom)
+	case app.LinesFrom > 0:
+		return fmt.Sprintf("from line +%d", app.LinesFrom)
+	case app.HeadMode:
+		return fmt.Sprintf("first %d lines", app.InitialLines)
+	default:
+		return fmt.Sprintf("last %d lines", app.InitialLines)
+	}
+}
+
+// loadOlderSupported is true when we can extend the tail window (default last-N-lines mode only).
+func (app *App) loadOlderSupported() bool {
+	if app.FullMode || app.followMode || app.HeadMode {
+		return false
+	}
+	if app.BytesLast > 0 || app.BytesFrom > 0 || app.LinesFrom > 0 {
+		return false
+	}
+	return true
+}
+
+func (app *App) loadOlderLinesInFocusedRegion(extra int) {
+	if extra < 1 {
+		app.setReloadStatus("Load older: need at least 1 line")
+		return
+	}
+	if !app.loadOlderSupported() {
+		switch {
+		case app.FullMode:
+			app.setReloadStatus("Load older unavailable in --full mode")
+		case app.followMode:
+			app.setReloadStatus("Load older unavailable while following (-f)")
+		case app.HeadMode:
+			app.setReloadStatus("Load older unavailable in --head mode")
+		case app.BytesLast > 0 || app.BytesFrom > 0:
+			app.setReloadStatus("Load older not supported for -c byte mode")
+		case app.LinesFrom > 0:
+			app.setReloadStatus("Load older not supported for +N line mode")
+		default:
+			app.setReloadStatus("Load older unavailable")
+		}
+		return
+	}
+	r := app.currentRegion()
+	if r == nil {
+		return
+	}
+	path := r.Path
+	r.LinesMutex.Lock()
+	oldLen := len(r.Lines)
+	savedCur := 0
+	if r.List != nil && r.List.GetItemCount() > 0 {
+		savedCur = r.List.GetCurrentItem()
+	}
+	r.LinesMutex.Unlock()
+
+	nextN := oldLen + extra
+	if nextN > app.MaxLines {
+		if oldLen >= app.MaxLines {
+			app.setReloadStatus(fmt.Sprintf("Already at --max-lines (%d)", app.MaxLines))
+			return
+		}
+		nextN = app.MaxLines
+	}
+
+	lines, err := app.readLastNLines(path, nextN, app.lineDelim())
+	if err != nil {
+		app.setReloadStatus(fmt.Sprintf("Load older: %v", err))
+		return
+	}
+
+	r.LinesMutex.Lock()
+	r.Lines = lines
+	r.LinesMutex.Unlock()
+
+	r.List.Clear()
+	for _, line := range lines {
+		r.List.AddItem(app.lineDisplayText(line), "", 0, nil)
+	}
+
+	delta := len(lines) - oldLen
+	newCur := savedCur + delta
+	if len(lines) == 0 {
+		newCur = 0
+	} else {
+		if newCur >= len(lines) {
+			newCur = len(lines) - 1
+		}
+		if newCur < 0 {
+			newCur = 0
+		}
+	}
+	r.List.SetCurrentItem(newCur)
+	app.selectedLineIndex = newCur
+	app.updateProgressBar()
+	app.updateHelpPane()
+}
+
 // setReloadStatus shows a transient message on the help line; clears after a few seconds.
 func (app *App) setReloadStatus(msg string) {
 	app.reloadStatus = msg
@@ -878,8 +985,12 @@ func (app *App) startOutputReload() {
 					app.selectedLineIndex = lv.GetCurrentItem()
 				}
 			}
-			at := time.Now().Format("15:04:05")
-			app.reloadStatus = fmt.Sprintf("Re-loaded at: %s", at)
+			loc := app.reloadDataLocationLabel()
+			if len(app.fileRegions) > 1 {
+				app.reloadStatus = fmt.Sprintf("Re-loaded at: %s · %d files", loc, len(app.fileRegions))
+			} else {
+				app.reloadStatus = fmt.Sprintf("Re-loaded at: %s", loc)
+			}
 			if app.reloadStatusTimer != nil {
 				app.reloadStatusTimer.Stop()
 			}
@@ -1145,16 +1256,19 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 		}
 		return nil
 	}
-	// When in search or add-rule popup, only handle Tab/Backtab/Escape; pass everything else to the input
-	if app.currentFocus == focusSearchInput || app.currentFocus == focusRuleInput {
+	// When in search, add-rule, or load-older popup, only handle Tab/Backtab/Escape; pass everything else to the input
+	if app.currentFocus == focusSearchInput || app.currentFocus == focusRuleInput || app.currentFocus == focusLoadOlderInput {
 		switch event.Key() {
 		case tcell.KeyTab, tcell.KeyBacktab:
 			return nil
 		case tcell.KeyEscape:
-			if app.currentFocus == focusSearchInput {
+			switch app.currentFocus {
+			case focusSearchInput:
 				app.cancelSearch()
-			} else {
+			case focusRuleInput:
 				app.cancelAddRule()
+			case focusLoadOlderInput:
+				app.cancelLoadOlderInput()
 			}
 			return nil
 		default:
@@ -1176,11 +1290,14 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 		if app.tviewApp.GetFocus() == app.saveFilenameInput {
 			app.cancelSave()
 			return nil
-		} else if app.currentFocus == focusSearchInput || app.currentFocus == focusRuleInput {
-			if app.currentFocus == focusSearchInput {
+		} else if app.currentFocus == focusSearchInput || app.currentFocus == focusRuleInput || app.currentFocus == focusLoadOlderInput {
+			switch app.currentFocus {
+			case focusSearchInput:
 				app.cancelSearch()
-			} else {
+			case focusRuleInput:
 				app.cancelAddRule()
+			case focusLoadOlderInput:
+				app.cancelLoadOlderInput()
 			}
 			return nil
 		}
@@ -1193,19 +1310,19 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			app.showHelp()
 			return nil
 		case keyBindings["reload"]:
-			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
+			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput && app.currentFocus != focusLoadOlderInput {
 				app.startOutputReload()
 				return nil
 			}
 		case keyBindings["rollover"]:
 			// Only when not in search or add-rule popup
-			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
+			if app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput && app.currentFocus != focusLoadOlderInput {
 				app.cycleRolloverMode()
 				return nil
 			}
 		case keyBindings["searchCase"]:
 			// c toggles search case when in messages view (not in search/add-rule); in rules view 'c' stays for rule sensitive
-			if app.currentFocus == focusMessages && app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput {
+			if app.currentFocus == focusMessages && app.currentFocus != focusSearchInput && app.currentFocus != focusRuleInput && app.currentFocus != focusLoadOlderInput {
 				app.searchCaseSensitive = !app.searchCaseSensitive
 				app.updateHelpPane()
 				return nil
@@ -1214,7 +1331,7 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			if app.textPopupOnClose != nil {
 				return nil
 			}
-			if app.currentFocus != focusRuleInput && app.currentFocus != focusSearchInput && app.tviewApp.GetFocus() != app.saveFilenameInput {
+			if app.currentFocus != focusRuleInput && app.currentFocus != focusSearchInput && app.currentFocus != focusLoadOlderInput && app.tviewApp.GetFocus() != app.saveFilenameInput {
 				app.quit()
 				return nil
 			}
@@ -1270,7 +1387,17 @@ func (app *App) handleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 			app.viewSelectedLine()
 			return nil
 		case tcell.KeyRune:
-			switch event.Rune() {
+			rn := event.Rune()
+			// Shift+l is usually rune 'L'; tcell often does not set ModShift for shifted letters.
+			if rn == 'L' {
+				app.initiateLoadOlderPrompt()
+				return nil
+			}
+			if rn == 'l' {
+				app.loadOlderLinesInFocusedRegion(loadOlderStep)
+				return nil
+			}
+			switch rn {
 			case keyBindings["view"]:
 				app.viewSelectedLine()
 			case keyBindings["follow"]:
@@ -1422,6 +1549,58 @@ func (app *App) initiateSearch() {
 	app.currentFocus = focusSearchInput
 }
 
+// closeLoadOlderInput closes the load-older popup.
+func (app *App) closeLoadOlderInput() {
+	app.clearPopup()
+	app.currentFocus = focusMessages
+}
+
+func (app *App) cancelLoadOlderInput() {
+	app.closeLoadOlderInput()
+}
+
+// initiateLoadOlderPrompt shows a popup to enter how many older lines to load (Enter = load, Esc = cancel).
+func (app *App) initiateLoadOlderPrompt() {
+	logging.LogAppAction("Initiating load older amount (popup)")
+	app.loadOlderInput.SetText("")
+	app.loadOlderInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			s := strings.TrimSpace(app.loadOlderInput.GetText())
+			app.closeLoadOlderInput()
+			n, err := strconv.Atoi(s)
+			if err != nil || n < 1 {
+				app.setReloadStatus("Load older: enter a positive number")
+				return
+			}
+			app.loadOlderLinesInFocusedRegion(n)
+		} else if key == tcell.KeyEscape {
+			app.cancelLoadOlderInput()
+		}
+	})
+	_, _, w, _ := app.rootOverlay.GetRect()
+	if w <= 0 {
+		w = 80
+	}
+	popupW := w / 2
+	if popupW < 40 {
+		popupW = 40
+	}
+	inner := popupW - 2
+	label := "Load older (lines): "
+	labelLen := len(label)
+	fieldW := inner - labelLen
+	if fieldW < 5 {
+		fieldW = 5
+	}
+	app.loadOlderInput.SetLabel(label)
+	app.loadOlderInput.SetFieldWidth(fieldW)
+	popup := tview.NewGrid().SetRows(1).SetColumns(-1).AddItem(app.loadOlderInput, 0, 0, 1, 1, 0, 0, true)
+	popup.SetBorder(true).SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+	app.rootOverlay.SetPopupWithFocus(popup, app.loadOlderInput, 3)
+	app.tviewApp.SetFocus(app.rootOverlay)
+	app.currentFocus = focusLoadOlderInput
+}
+
 // performSearch searches through the messages for the search term
 func (app *App) performSearch() {
 	app.searchResults = []int{}
@@ -1552,8 +1731,8 @@ func (app *App) cycleFocus(forward bool) {
 		}
 	case focusRulesView:
 		slot = messageSlots
-	case focusRuleInput, focusSearchInput:
-		// From rule/search input, "next" wraps to first file
+	case focusRuleInput, focusSearchInput, focusLoadOlderInput:
+		// From rule/search/load-older input, "next" wraps to first file
 		slot = messageSlots
 	default:
 		slot = 0
@@ -1851,6 +2030,13 @@ func (app *App) initUI() {
 		app.currentFocus = focusSearchInput
 	})
 
+	app.loadOlderInput = tview.NewInputField()
+	app.loadOlderInput.SetLabel("Load older (lines): ")
+	app.loadOlderInput.SetFieldWidth(12)
+	app.loadOlderInput.SetFocusFunc(func() {
+		app.currentFocus = focusLoadOlderInput
+	})
+
 	// Initialize progressBar
 	app.progressBar = tview.NewTextView()
 	app.progressBar.SetDynamicColors(true)
@@ -1950,6 +2136,8 @@ func (app *App) showHelp() {
 - Up/Down: Navigate lines
 - Enter, v: View selected line
 - r: Reload from disk (same scope as startup; not with -f or --full)
+- l: Load 10 more older lines (default last-N mode only)
+- L: Prompt for how many older lines to load (Shift+l; plain l loads 10)
 - /: Open search input
 - n: Next search result
 - f: Toggle follow mode`)

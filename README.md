@@ -4,13 +4,15 @@ A TUI for viewing and filtering log files using matching rules.
 
 ## Features
 
-- View files with optional follow (tail) mode; use -F to follow by name (reopen on log rotation)
-- Filter lines with regex-based matching rules
-- Colour rules via JSON config (e.g. highlight ERROR, WARN, INFO)
-- Search, navigate, and save filtered content
-- Configurable initial line count and max lines in memory
-- Optional “full” mode to navigate the whole file without loading everything into memory
-- Optional “head” mode to show the first N lines instead of the last
+- View **one or more** files side by side (each file gets a header and line list; **Tab** moves focus between files and the rules pane)
+- Optional follow (tail) mode; use **-F** to follow by name (reopen on log rotation)
+- Filter lines with regex-based **matching rules**
+- **Colour rules** via JSON config (e.g. highlight ERROR, WARN, INFO)
+- **Search** (`/`), **navigate**, **reload** (`r`), and **save** filtered content
+- **Load older lines** from the file without a full reload: extend the initial “last N lines” window toward the start of the file (see [Load older lines](#load-older-lines))
+- Configurable initial line count (`-n`), max lines in memory (`--max-lines`), **rollover** at list edges, and default **search case sensitivity** (see [Configuration](#configuration))
+- Optional **full** mode to navigate the whole file without loading everything into memory
+- Optional **head** mode to show the first N lines instead of the last
 
 ## Build
 
@@ -20,7 +22,7 @@ go build -o ttail .
 
 ## Configuration
 
-Default values for all flags are read from a JSON config file. If the file does not exist, it is created on first run with built-in defaults and a message is printed to stderr:
+Default values for many flags are read from a JSON config file. If the file does not exist, it is created on first run with built-in defaults and a message is printed to stderr:
 
 ```text
 Default config generated in /home/you/.config/ttail/ttail.json
@@ -46,9 +48,23 @@ Only options that make sense as persistent defaults are stored in config. One-sh
   "colour_file": "",
   "log_file": "",
   "follow": false,
-  "follow_name": false
+  "follow_name": false,
+  "rollover": "both",
+  "searchcase": false
 }
 ```
+
+| Field | Meaning |
+|-------|---------|
+| `num_lines` | Default for `-n` / `--num-lines` (last N lines, or first N with `--head`) |
+| `max_lines` | Default for `--max-lines` (cap on lines kept in memory) |
+| `rules_file` | Default path for `--rules-file` |
+| `colour_file` | Default path for `--colour-file` |
+| `log_file` | Default for `--log-file` |
+| `follow` | Default for `-f` / `--follow` |
+| `follow_name` | Default for `-F` / `--follow-name` |
+| `rollover` | Default list wrap: `"none"`, `"start"`, `"end"`, or `"both"` (wrap at top, bottom, or both) |
+| `searchcase` | Default: if `true`, search is case-sensitive; if `false`, case-insensitive |
 
 Command-line flags override config file values.
 
@@ -87,14 +103,14 @@ Here, any occurrence of `ERROR`, `WARN`, `INFO`, or `DEBUG` in a line is highlig
 ## Usage
 
 ```text
-ttail [FILE] [flags]
+ttail [FILE]... [flags]
 ```
 
 ### Arguments
 
 | Argument | Description |
 |----------|-------------|
-| `FILE`   | Log file to view (required) |
+| `FILE`…  | One or more paths to view (required). Each file is shown in its own pane with a path header and scrollable line list. |
 
 ### Flags
 
@@ -119,10 +135,68 @@ Flags that match GNU tail have a short form in parentheses.
 | `--help`            |       | Show help |
 | `--version`         |       | Show version |
 
-### Examples
+### Keyboard shortcuts (TUI)
+
+Press **`h`** or **`?`** in the app for the in-TUI help popup. Summary:
+
+**Global**
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `h`, `?` | Help |
+| `Tab` / `Shift+Tab` | Cycle focus between file list(s) and the rules pane |
+| `r` | Reload output from disk (same scope as startup; not while following `-f` or in `--full`) |
+| `o` | Cycle rollover mode (how the line list wraps at the first/last line) |
+
+**Messages / file view** (when focus is on a file’s line list)
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move selection |
+| `Enter`, `v` | View full selected line |
+| `f` | Toggle follow mode (`-f`) |
+| `/` | Open search |
+| `n` | Jump to next search match |
+| `c` | Toggle search case sensitivity (when not in the rules pane for rule-specific `c`) |
+| `l` | Load **10** more **older** lines from the file (see [Load older lines](#load-older-lines)) |
+| `L` | Prompt for how many older lines to load |
+
+**Rules pane**
+
+| Key | Action |
+|-----|--------|
+| `d` | Delete selected rule |
+| `c` | Toggle case sensitivity for the selected rule |
+| `p` | Toggle partial match for the selected rule |
+| `a` | Add matching rule (popup) |
+| `s` | Save (export) |
+
+**Popups** (search, add rule, load-older amount, help, view line)
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Confirm |
+| `Esc` | Close |
+
+### Load older lines
+
+In the default **last N lines** mode (not `--head`, not `-c`, not `-n +N`, not `--full`), you can extend the window backward toward the start of the file:
+
+- **`l`** — append **10** older lines at the **top** of the buffer; the selection stays on the **same logical line** (the view shifts).
+- **`L`** — open a popup to type a positive number of extra older lines, then **Enter** to apply.
+
+**When it is unavailable:** `--full`, **follow** (`-f`), `--head`, **byte mode** (`-c`), or **from-line mode** (`-n +N`). In those cases the app shows a short status message instead.
+
+**Limit:** The total number of lines cannot exceed **`--max-lines`**. If you are already at the cap, you will see a message to that effect.
+
+**Multiple files:** Load-older applies to the **focused** file pane (use **Tab** to switch).
+
+## Examples
 
 ```bash
 ttail /var/log/app.log
+ttail /var/log/a.log /var/log/b.log              # two files side by side
 ttail /var/log/app.log -n 100 --colour-file colour_rule_example.json
 ttail /var/log/app.log -n +100                  # from line 100 to end (like GNU tail -n +100)
 ttail /var/log/app.log -c 1024                  # last 1024 bytes
