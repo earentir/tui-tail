@@ -1201,7 +1201,8 @@ func (app *App) initiateAddRule() {
 	logging.LogAppAction("Initiating add matching rule (popup)")
 	app.ruleInput.SetText("")
 	app.ruleInput.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
+		switch key {
+		case tcell.KeyEnter:
 			ruleText := strings.TrimSpace(app.ruleInput.GetText())
 			app.closeAddRuleInput()
 			if ruleText != "" {
@@ -1213,7 +1214,7 @@ func (app *App) initiateAddRule() {
 				app.rules = append(app.rules, rule)
 				app.updateRulesView()
 			}
-		} else if key == tcell.KeyEscape {
+		case tcell.KeyEscape:
 			app.closeAddRuleInput()
 		}
 	})
@@ -1515,14 +1516,15 @@ func (app *App) initiateSearch() {
 	logging.LogAppAction("Initiating search operation (popup)")
 	app.searchInput.SetText("")
 	app.searchInput.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
+		switch key {
+		case tcell.KeyEnter:
 			app.searchTerm = strings.TrimSpace(app.searchInput.GetText())
 			app.closeSearchInput()
 			if app.searchTerm != "" {
 				app.performSearch()
 				app.updateHelpPane()
 			}
-		} else if key == tcell.KeyEscape {
+		case tcell.KeyEscape:
 			app.cancelSearch()
 		}
 	})
@@ -1564,7 +1566,8 @@ func (app *App) initiateLoadOlderPrompt() {
 	logging.LogAppAction("Initiating load older amount (popup)")
 	app.loadOlderInput.SetText("")
 	app.loadOlderInput.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
+		switch key {
+		case tcell.KeyEnter:
 			s := strings.TrimSpace(app.loadOlderInput.GetText())
 			app.closeLoadOlderInput()
 			n, err := strconv.Atoi(s)
@@ -1573,7 +1576,7 @@ func (app *App) initiateLoadOlderPrompt() {
 				return
 			}
 			app.loadOlderLinesInFocusedRegion(n)
-		} else if key == tcell.KeyEscape {
+		case tcell.KeyEscape:
 			app.cancelLoadOlderInput()
 		}
 	})
