@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"ttail/logging"
@@ -420,12 +419,6 @@ func (app *App) Run() error {
 		}
 	}
 	return app.tviewApp.Run()
-}
-
-// processExists reports whether the process with the given PID exists (Unix: kill(pid, 0)).
-// On Windows this may not be reliable; --pid is primarily for Unix.
-func processExists(pid int) bool {
-	return syscall.Kill(pid, syscall.Signal(0)) == nil
 }
 
 // monitorPid exits the app when the process with app.Pid dies (GNU tail --pid).
